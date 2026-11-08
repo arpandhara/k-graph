@@ -1,9 +1,9 @@
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::str::FromStr;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Errors that can occur when parsing a SymbolUri.
+/// Errors that can occur when constructing or parsing a SymbolUri.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum UriParseError {
     #[error("URI must begin with 'sym://', got: '{0}'")]
@@ -14,6 +14,16 @@ pub enum UriParseError {
     MissingFragment(String),
     #[error("Invalid fragment format in URI: '{0}'")]
     InvalidFragment(String),
+    #[error("Invalid repository segment in URI: '{0}'")]
+    InvalidRepo(String),
+    #[error("Invalid relative file path in URI: '{0}'")]
+    InvalidPath(String),
+    #[error("Invalid symbol name in URI: '{0}'")]
+    InvalidName(String),
+    #[error("Invalid scope in URI: '{0}'")]
+    InvalidScope(String),
+    #[error("Invalid kind suffix in URI: '{0}'")]
+    InvalidKind(String),
 }
 
 /// A parsed representation of the components inside a SymbolUri.
@@ -32,40 +42,60 @@ pub struct ParsedSymbolUri {
 /// `sym://<repo>/<path>#<scope>::<name>:<kind>`
 /// or without scope:
 /// `sym://<repo>/<path>#<name>:<kind>`
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+///
+/// The inner string is private and every construction path validates the
+/// grammar, normalizes the kind suffix to lowercase, and rejects path traversal.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct SymbolUri(String);
 
 impl SymbolUri {
     /// Create a new `SymbolUri` from individual symbol components.
-    pub fn new(repo: &str, file_path: &str, scope: Option<&str>, name: &str, kind_suffix: &str) -> Self {
-        let clean_repo = repo.trim_matches('/');
-        let clean_path = file_path.trim_matches('/');
+    ///
+    /// Returns an error when a component contains a reserved delimiter,
+    /// control character, an absolute path, or a `..` path segment.
+    pub fn new(
+        repo: &str,
+        file_path: &str,
+        scope: Option<&str>,
+        name: &str,
+        kind_suffix: &str,
+    ) -> Result<Self, UriParseError> {
+        let clean_repo = repo.trim();
+        let clean_path = file_path.trim();
         let clean_name = name.trim();
-        let clean_kind = kind_suffix.trim().to_ascii_lowercase();
+        let clean_kind = validate_kind(kind_suffix.trim())?;
+        let clean_scope = scope.map(str::trim).filter(|s| !s.is_empty());
 
-        let fragment = match scope {
-            Some(s) if !s.trim().is_empty() => {
-                format!("{}::{}:{}", s.trim(), clean_name, clean_kind)
-            }
-            _ => format!("{}:{}", clean_name, clean_kind),
+        validate_repo(clean_repo, repo)?;
+        validate_file_path(clean_path, file_path)?;
+        validate_name(clean_name)?;
+        if let Some(scope) = clean_scope {
+            validate_scope(scope)?;
+        }
+
+        let fragment = match clean_scope {
+            Some(scope) => format!("{}::{}:{}", scope, clean_name, clean_kind),
+            None => format!("{}:{}", clean_name, clean_kind),
         };
 
-        Self(format!("sym://{}/{}#{}", clean_repo, clean_path, fragment))
+        Ok(Self(format!(
+            "sym://{}/{}#{}",
+            clean_repo, clean_path, fragment
+        )))
     }
 
     /// Helper to construct a URI representing a whole file.
-    pub fn for_file(repo: &str, file_path: &str) -> Self {
-        let clean_repo = repo.trim_matches('/');
-        let clean_path = file_path.trim_matches('/');
-        Self(format!("sym://{}/{}#file:file", clean_repo, clean_path))
+    pub fn for_file(repo: &str, file_path: &str) -> Result<Self, UriParseError> {
+        Self::new(repo, file_path, None, "file", "file")
     }
 
     /// Helper to construct a URI representing a module.
-    pub fn for_module(repo: &str, file_path: &str, module_name: &str) -> Self {
-        let clean_repo = repo.trim_matches('/');
-        let clean_path = file_path.trim_matches('/');
-        Self(format!("sym://{}/{}#{}:mod", clean_repo, clean_path, module_name.trim()))
+    pub fn for_module(
+        repo: &str,
+        file_path: &str,
+        module_name: &str,
+    ) -> Result<Self, UriParseError> {
+        Self::new(repo, file_path, None, module_name, "mod")
     }
 
     /// Access the raw string representation.
@@ -75,32 +105,69 @@ impl SymbolUri {
 
     /// Parse the components out of the URI string.
     pub fn parse(&self) -> Result<ParsedSymbolUri, UriParseError> {
-        let raw = &self.0;
+        Self::parse_inner(&self.0)
+    }
+
+    /// Return the file path portion of the URI.
+    ///
+    /// The URI is guaranteed valid at construction time, so an error here
+    /// indicates an internal invariant violation rather than user input.
+    pub fn file_path(&self) -> Result<String, UriParseError> {
+        Ok(self.parse()?.file_path)
+    }
+
+    /// Return the repo portion of the URI.
+    pub fn repo(&self) -> Result<String, UriParseError> {
+        Ok(self.parse()?.repo)
+    }
+
+    /// Return the symbol name portion of the URI.
+    pub fn name(&self) -> Result<String, UriParseError> {
+        Ok(self.parse()?.name)
+    }
+
+    fn parse_inner(raw: &str) -> Result<ParsedSymbolUri, UriParseError> {
         let stripped = raw
             .strip_prefix("sym://")
-            .ok_or_else(|| UriParseError::MissingScheme(raw.clone()))?;
+            .ok_or_else(|| UriParseError::MissingScheme(raw.to_string()))?;
 
         let (path_part, fragment_part) = stripped
             .split_once('#')
-            .ok_or_else(|| UriParseError::MissingFragment(raw.clone()))?;
+            .ok_or_else(|| UriParseError::MissingFragment(raw.to_string()))?;
+
+        // A second '#' makes the component split ambiguous.
+        if fragment_part.contains('#') {
+            return Err(UriParseError::InvalidFragment(raw.to_string()));
+        }
 
         let (repo, file_path) = path_part
             .split_once('/')
-            .ok_or_else(|| UriParseError::MissingPath(raw.clone()))?;
+            .ok_or_else(|| UriParseError::MissingPath(raw.to_string()))?;
 
-        if repo.is_empty() || file_path.is_empty() {
-            return Err(UriParseError::MissingPath(raw.clone()));
-        }
+        validate_repo(repo, raw)?;
+        validate_file_path(file_path, raw)?;
 
         // Fragment part: [scope::]name:kind
-        let (symbol_part, kind_suffix) = fragment_part
+        let (symbol_part, kind_raw) = fragment_part
             .rsplit_once(':')
-            .ok_or_else(|| UriParseError::InvalidFragment(raw.clone()))?;
+            .ok_or_else(|| UriParseError::InvalidFragment(raw.to_string()))?;
 
-        let (scope, name) = if let Some((s, n)) = symbol_part.rsplit_once("::") {
-            (Some(s.to_string()), n.to_string())
+        let kind_suffix = validate_kind(kind_raw)?;
+
+        let parts: Vec<&str> = symbol_part.split("::").collect();
+        if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
+            return Err(UriParseError::InvalidFragment(raw.to_string()));
+        }
+
+        let name = parts[parts.len() - 1].to_string();
+        validate_name(&name)?;
+
+        let scope = if parts.len() > 1 {
+            let scope = parts[..parts.len() - 1].join("::");
+            validate_scope(&scope)?;
+            Some(scope)
         } else {
-            (None, symbol_part.to_string())
+            None
         };
 
         Ok(ParsedSymbolUri {
@@ -108,29 +175,106 @@ impl SymbolUri {
             file_path: file_path.to_string(),
             scope,
             name,
-            kind_suffix: kind_suffix.to_string(),
+            kind_suffix,
         })
     }
+}
 
-    /// Return the file path portion of the URI.
-    pub fn file_path(&self) -> String {
-        self.parse()
-            .map(|p| p.file_path)
-            .unwrap_or_else(|_| "".to_string())
+fn validate_repo(repo: &str, raw: &str) -> Result<(), UriParseError> {
+    if repo.is_empty() {
+        return Err(UriParseError::MissingPath(raw.to_string()));
     }
 
-    /// Return the repo portion of the URI.
-    pub fn repo(&self) -> String {
-        self.parse()
-            .map(|p| p.repo)
-            .unwrap_or_else(|_| "".to_string())
+    if repo.trim() != repo
+        || repo
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '#' | ':' | '\\'))
+    {
+        return Err(UriParseError::InvalidRepo(repo.to_string()));
     }
 
-    /// Return the symbol name portion of the URI.
-    pub fn name(&self) -> String {
-        self.parse()
-            .map(|p| p.name)
-            .unwrap_or_else(|_| "".to_string())
+    Ok(())
+}
+
+fn validate_file_path(path: &str, raw: &str) -> Result<(), UriParseError> {
+    if path.is_empty() {
+        return Err(UriParseError::MissingPath(raw.to_string()));
+    }
+
+    if path.trim() != path
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '#' | ':'))
+    {
+        return Err(UriParseError::InvalidPath(path.to_string()));
+    }
+
+    for segment in path.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(UriParseError::InvalidPath(path.to_string()));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_name(name: &str) -> Result<(), UriParseError> {
+    if name.is_empty()
+        || name.trim() != name
+        || name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '#' | ':'))
+    {
+        return Err(UriParseError::InvalidName(name.to_string()));
+    }
+
+    Ok(())
+}
+
+fn validate_scope(scope: &str) -> Result<(), UriParseError> {
+    if scope.trim() != scope {
+        return Err(UriParseError::InvalidScope(scope.to_string()));
+    }
+
+    for part in scope.split("::") {
+        if part.is_empty()
+            || part.trim() != part
+            || part
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '/' | '#' | ':'))
+        {
+            return Err(UriParseError::InvalidScope(scope.to_string()));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_kind(kind: &str) -> Result<String, UriParseError> {
+    if kind.is_empty() || kind.trim() != kind {
+        return Err(UriParseError::InvalidKind(kind.to_string()));
+    }
+
+    let canonical = kind.to_ascii_lowercase();
+    if !canonical
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(UriParseError::InvalidKind(kind.to_string()));
+    }
+
+    Ok(canonical)
+}
+
+impl<'de> Deserialize<'de> for SymbolUri {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -150,10 +294,19 @@ impl FromStr for SymbolUri {
     type Err = UriParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let uri = Self(s.to_string());
-        // Validate by parsing
-        uri.parse()?;
-        Ok(uri)
+        // Validate, then rebuild the canonical form. This normalizes the kind
+        // suffix so all construction paths produce the same identity.
+        let parsed = Self::parse_inner(s)?;
+
+        let fragment = match parsed.scope.as_deref() {
+            Some(scope) => format!("{}::{}:{}", scope, parsed.name, parsed.kind_suffix),
+            None => format!("{}:{}", parsed.name, parsed.kind_suffix),
+        };
+
+        Ok(Self(format!(
+            "sym://{}/{}#{}",
+            parsed.repo, parsed.file_path, fragment
+        )))
     }
 }
 
@@ -177,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_uri_creation_and_parse_with_scope() {
-        let uri = SymbolUri::new("rusty", "src/index.rs", Some("Index"), "load", "fn");
+        let uri = SymbolUri::new("rusty", "src/index.rs", Some("Index"), "load", "fn").unwrap();
         assert_eq!(uri.as_str(), "sym://rusty/src/index.rs#Index::load:fn");
 
         let parsed = uri.parse().expect("Failed to parse URI");
@@ -190,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_uri_creation_without_scope() {
-        let uri = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn");
+        let uri = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn").unwrap();
         assert_eq!(uri.as_str(), "sym://rusty/src/add.rs#add_file:fn");
 
         let parsed = uri.parse().expect("Failed to parse URI");
@@ -203,17 +356,21 @@ mod tests {
 
     #[test]
     fn test_uri_file_and_module_helpers() {
-        let file_uri = SymbolUri::for_file("rusty", "src/lib.rs");
+        let file_uri = SymbolUri::for_file("rusty", "src/lib.rs").unwrap();
         assert_eq!(file_uri.as_str(), "sym://rusty/src/lib.rs#file:file");
 
-        let mod_uri = SymbolUri::for_module("rusty", "src/engine/mod.rs", "engine");
+        let mod_uri = SymbolUri::for_module("rusty", "src/engine/mod.rs", "engine").unwrap();
         assert_eq!(mod_uri.as_str(), "sym://rusty/src/engine/mod.rs#engine:mod");
     }
 
     #[test]
     fn test_uri_nested_scopes() {
-        let uri = SymbolUri::new("rusty", "src/tui/app.rs", Some("App::State"), "draw", "fn");
-        assert_eq!(uri.as_str(), "sym://rusty/src/tui/app.rs#App::State::draw:fn");
+        let uri =
+            SymbolUri::new("rusty", "src/tui/app.rs", Some("App::State"), "draw", "fn").unwrap();
+        assert_eq!(
+            uri.as_str(),
+            "sym://rusty/src/tui/app.rs#App::State::draw:fn"
+        );
 
         let parsed = uri.parse().unwrap();
         assert_eq!(parsed.scope.as_deref(), Some("App::State"));
@@ -221,20 +378,71 @@ mod tests {
     }
 
     #[test]
+    fn test_uri_kind_is_canonicalized() {
+        let uri = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "FN").unwrap();
+        assert_eq!(uri.as_str(), "sym://rusty/src/add.rs#add_file:fn");
+
+        let parsed: SymbolUri = "sym://rusty/src/add.rs#add_file:Fn".parse().unwrap();
+        assert_eq!(parsed.as_str(), "sym://rusty/src/add.rs#add_file:fn");
+    }
+
+    #[test]
     fn test_uri_invalid_parsing() {
         assert!(SymbolUri("http://foo.bar".to_string()).parse().is_err());
         assert!(SymbolUri("sym://repo".to_string()).parse().is_err());
         assert!(SymbolUri("sym://repo/file.rs".to_string()).parse().is_err());
-        assert!(SymbolUri("sym://repo/file.rs#symbol".to_string()).parse().is_err());
+        assert!(
+            SymbolUri("sym://repo/file.rs#symbol".to_string())
+                .parse()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_uri_rejects_ambiguous_and_traversal_components() {
+        assert!(SymbolUri::new("rusty", "src/a#b.rs", None, "f", "fn").is_err());
+        assert!(SymbolUri::new("rusty", "../etc/passwd", None, "f", "fn").is_err());
+        assert!(SymbolUri::new("rusty", "/etc/passwd", None, "f", "fn").is_err());
+        assert!(SymbolUri::new("rusty", "src/./a.rs", None, "f", "fn").is_err());
+        assert!(SymbolUri::new("rusty", "src//a.rs", None, "f", "fn").is_err());
+        assert!(SymbolUri::new("rusty", "src/a.rs\u{0}", None, "f", "fn").is_err());
+        assert!(SymbolUri::new("rusty", "src/a.rs", Some("S::"), "f", "fn").is_err());
+        assert!(SymbolUri::new("rusty", "src/a.rs", None, "a:b", "fn").is_err());
+        assert!(SymbolUri::new("rusty", "src/a.rs", None, "f", "f n").is_err());
+        assert!(SymbolUri::new("ru/sty", "src/a.rs", None, "f", "fn").is_err());
+
+        assert!(SymbolUri::from_str("sym://rusty//etc/passwd#f:fn").is_err());
+        assert!(SymbolUri::from_str("sym://rusty/src/../a.rs#f:fn").is_err());
+        assert!(SymbolUri::from_str("sym://rusty/src/a.rs#a::b::c:fn").is_ok());
+    }
+
+    #[test]
+    fn test_uri_getters_report_errors_and_values() {
+        let uri = SymbolUri::new("rusty", "src/add.rs", Some("Repo"), "add_file", "fn").unwrap();
+        assert_eq!(uri.repo().unwrap(), "rusty");
+        assert_eq!(uri.file_path().unwrap(), "src/add.rs");
+        assert_eq!(uri.name().unwrap(), "add_file");
+
+        let broken = SymbolUri("not-a-uri".to_string());
+        assert!(broken.repo().is_err());
+        assert!(broken.file_path().is_err());
+        assert!(broken.name().is_err());
     }
 
     #[test]
     fn test_uri_serde_roundtrip() {
-        let uri = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn");
+        let uri = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn").unwrap();
         let json = serde_json::to_string(&uri).unwrap();
         assert_eq!(json, "\"sym://rusty/src/add.rs#add_file:fn\"");
 
         let deserialized: SymbolUri = serde_json::from_str(&json).unwrap();
         assert_eq!(uri, deserialized);
+    }
+
+    #[test]
+    fn test_uri_deserialization_rejects_invalid_values() {
+        assert!(serde_json::from_str::<SymbolUri>("\"not-a-uri\"").is_err());
+        assert!(serde_json::from_str::<SymbolUri>("\"sym://r/../etc#f:fn\"").is_err());
+        assert!(serde_json::from_str::<SymbolUri>("\"sym://r/a#f:FN\"").is_ok());
     }
 }

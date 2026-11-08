@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use dashmap::DashMap;
+use petgraph::Direction;
 use petgraph::stable_graph::{EdgeIndex, NodeIndex, StableDiGraph};
 use petgraph::visit::EdgeRef;
-use petgraph::Direction;
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
+use super::error::GraphError;
 use crate::model::{CodeEdge, CodeEntityNode, SymbolUri};
 
 /// Statistical overview of the in-memory graph.
@@ -23,16 +24,19 @@ pub struct GraphStats {
 ///
 /// Combines a `StableDiGraph` with fast $O(1)$ secondary indices for URIs, file paths, and symbol names.
 /// Using `StableDiGraph` ensures that removing nodes does not invalidate indices of other nodes.
+///
+/// All fields are private. Mutations must go through this module so the three
+/// indices and the redundant identity fields on `CodeEntityNode` stay consistent.
 #[derive(Clone)]
 pub struct MemoryGraph {
     /// Underlying directed graph with stable indices.
-    pub graph: StableDiGraph<CodeEntityNode, CodeEdge>,
+    graph: StableDiGraph<CodeEntityNode, CodeEdge>,
     /// URI -> NodeIndex index
-    pub uri_to_node: DashMap<SymbolUri, NodeIndex>,
+    uri_to_node: DashMap<SymbolUri, NodeIndex>,
     /// File path -> NodeIndices in that file
-    pub file_to_nodes: DashMap<String, Vec<NodeIndex>>,
+    file_to_nodes: DashMap<String, Vec<NodeIndex>>,
     /// Unqualified symbol name -> NodeIndices matching that name
-    pub name_index: DashMap<String, Vec<NodeIndex>>,
+    name_index: DashMap<String, Vec<NodeIndex>>,
 }
 
 impl Default for MemoryGraph {
@@ -62,44 +66,64 @@ impl MemoryGraph {
         self.graph.edge_count()
     }
 
-    /// Add a node to the graph or update its metadata if the URI already exists.
-    pub fn add_node(&mut self, node: CodeEntityNode) -> NodeIndex {
-        let uri = node.uri.clone();
-        let name = node.name.clone();
-        let file_path = node.file_path.clone();
+    /// Read-only access to the underlying graph.
+    pub fn graph(&self) -> &StableDiGraph<CodeEntityNode, CodeEdge> {
+        &self.graph
+    }
 
-        if let Some(existing_idx) = self.uri_to_node.get(&uri) {
-            let idx = *existing_idx;
-            if let Some(weight) = self.graph.node_weight_mut(idx) {
-                *weight = node;
+    /// Add a node to the graph or update its metadata if the URI already exists.
+    ///
+    /// The node's identity fields are validated against its URI. Re-adding an
+    /// existing URI is allowed only when the name and file path still match the
+    /// existing node, so the secondary indices never become stale.
+    pub fn add_node(&mut self, node: CodeEntityNode) -> Result<NodeIndex, GraphError> {
+        node.validate()?;
+
+        let uri = node.uri().clone();
+        let name = node.name().to_string();
+        let file_path = node.file_path().to_string();
+
+        if let Some(existing_idx) = self.uri_to_node.get(&uri).map(|entry| *entry) {
+            let existing_name = {
+                let existing = self
+                    .graph
+                    .node_weight(existing_idx)
+                    .ok_or(GraphError::MissingNode(existing_idx))?;
+                existing.name().to_string()
+            };
+            let existing_file = {
+                let existing = self
+                    .graph
+                    .node_weight(existing_idx)
+                    .ok_or(GraphError::MissingNode(existing_idx))?;
+                existing.file_path().to_string()
+            };
+
+            if existing_name != name || existing_file != file_path {
+                return Err(GraphError::IdentityMismatch);
             }
-            return idx;
+
+            let slot = self
+                .graph
+                .node_weight_mut(existing_idx)
+                .ok_or(GraphError::MissingNode(existing_idx))?;
+            *slot = node;
+            return Ok(existing_idx);
         }
 
         let idx = self.graph.add_node(node);
         self.uri_to_node.insert(uri, idx);
 
-        self.file_to_nodes
-            .entry(file_path)
-            .or_default()
-            .push(idx);
+        self.file_to_nodes.entry(file_path).or_default().push(idx);
 
-        self.name_index
-            .entry(name)
-            .or_default()
-            .push(idx);
+        self.name_index.entry(name).or_default().push(idx);
 
-        idx
+        Ok(idx)
     }
 
     /// Retrieve a node by its graph index.
     pub fn get_node(&self, idx: NodeIndex) -> Option<&CodeEntityNode> {
         self.graph.node_weight(idx)
-    }
-
-    /// Retrieve a mutable reference to a node by its graph index.
-    pub fn get_node_mut(&mut self, idx: NodeIndex) -> Option<&mut CodeEntityNode> {
-        self.graph.node_weight_mut(idx)
     }
 
     /// Find a node by its canonical `SymbolUri`.
@@ -124,7 +148,12 @@ impl MemoryGraph {
     }
 
     /// Add an edge between two entities directly by `NodeIndex`.
-    pub fn add_edge_by_index(&mut self, from: NodeIndex, to: NodeIndex, edge: CodeEdge) -> EdgeIndex {
+    pub fn add_edge_by_index(
+        &mut self,
+        from: NodeIndex,
+        to: NodeIndex,
+        edge: CodeEdge,
+    ) -> EdgeIndex {
         self.graph.add_edge(from, to, edge)
     }
 
@@ -141,15 +170,11 @@ impl MemoryGraph {
         };
 
         if let Some(node) = self.graph.node_weight(idx) {
-            let file_path = node.file_path.clone();
-            let name = node.name.clone();
+            let file_path = node.file_path().to_string();
+            let name = node.name().to_string();
 
-            if let Some(mut file_nodes) = self.file_to_nodes.get_mut(&file_path) {
-                file_nodes.retain(|&i| i != idx);
-            }
-            if let Some(mut name_nodes) = self.name_index.get_mut(&name) {
-                name_nodes.retain(|&i| i != idx);
-            }
+            Self::remove_index_entry(&self.file_to_nodes, &file_path, idx);
+            Self::remove_index_entry(&self.name_index, &name, idx);
         }
 
         self.graph.remove_node(idx)
@@ -168,11 +193,11 @@ impl MemoryGraph {
 
         for idx in indices {
             if let Some(node) = self.graph.node_weight(idx) {
-                self.uri_to_node.remove(&node.uri);
-                let name = node.name.clone();
-                if let Some(mut name_nodes) = self.name_index.get_mut(&name) {
-                    name_nodes.retain(|&i| i != idx);
-                }
+                let uri = node.uri().clone();
+                let name = node.name().to_string();
+
+                self.uri_to_node.remove(&uri);
+                Self::remove_index_entry(&self.name_index, &name, idx);
             }
             if let Some(removed) = self.graph.remove_node(idx) {
                 removed_nodes.push(removed);
@@ -180,6 +205,18 @@ impl MemoryGraph {
         }
 
         removed_nodes
+    }
+
+    /// Remove a single index entry and delete the bucket when it becomes empty.
+    fn remove_index_entry(map: &DashMap<String, Vec<NodeIndex>>, key: &str, idx: NodeIndex) {
+        if let Some(mut nodes) = map.get_mut(key) {
+            nodes.retain(|&i| i != idx);
+            let empty = nodes.is_empty();
+            drop(nodes);
+            if empty {
+                map.remove(key);
+            }
+        }
     }
 
     /// Find all nodes matching an unqualified symbol name.
@@ -227,18 +264,22 @@ impl MemoryGraph {
         let mut stats = GraphStats {
             total_nodes: self.graph.node_count(),
             total_edges: self.graph.edge_count(),
-            total_files: self.file_to_nodes.len(),
+            total_files: self
+                .file_to_nodes
+                .iter()
+                .filter(|entry| !entry.value().is_empty())
+                .count(),
             ..Default::default()
         };
 
         for node in self.graph.node_weights() {
-            let kind_str = format!("{:?}", node.kind);
+            let kind_str = format!("{:?}", node.kind());
             *stats.nodes_by_kind.entry(kind_str).or_default() += 1;
 
-            if node.kind.is_callable() {
+            if node.kind().is_callable() {
                 stats.total_callables += 1;
             }
-            if node.kind.is_type_definition() {
+            if node.kind().is_type_definition() {
                 stats.total_types += 1;
             }
         }
@@ -261,34 +302,215 @@ impl MemoryGraph {
 
     /// Validate index consistency against the underlying graph.
     pub fn validate_integrity(&self) -> Result<(), String> {
-        let actual_nodes = self.graph.node_count();
+        let active_nodes = self.graph.node_count();
         let uri_count = self.uri_to_node.len();
 
-        if actual_nodes != uri_count {
+        if active_nodes != uri_count {
             return Err(format!(
                 "Integrity violation: node_count ({}) != uri_to_node count ({})",
-                actual_nodes, uri_count
+                active_nodes, uri_count
             ));
         }
+
+        let mut uri_seen = HashSet::with_capacity(active_nodes);
 
         for entry in self.uri_to_node.iter() {
             let uri = entry.key();
             let idx = *entry.value();
-            match self.graph.node_weight(idx) {
-                Some(node) => {
-                    if node.uri != *uri {
-                        return Err(format!(
-                            "Integrity violation: index URI '{}' does not match node URI '{}'",
-                            uri, node.uri
-                        ));
-                    }
-                }
-                None => {
+
+            if !uri_seen.insert(idx) {
+                return Err(format!(
+                    "Integrity violation: duplicate URI index for NodeIndex {:?}",
+                    idx
+                ));
+            }
+
+            let node = self.graph.node_weight(idx).ok_or_else(|| {
+                format!(
+                    "Integrity violation: URI index '{}' points to missing node at idx {:?}",
+                    uri, idx
+                )
+            })?;
+
+            if node.uri() != uri {
+                return Err(format!(
+                    "Integrity violation: index URI '{}' does not match node URI '{}'",
+                    uri,
+                    node.uri()
+                ));
+            }
+
+            let parsed = uri.parse().map_err(|err| {
+                format!(
+                    "Integrity violation: index URI '{}' is not parseable: {}",
+                    uri, err
+                )
+            })?;
+
+            if node.name() != parsed.name {
+                return Err(format!(
+                    "Integrity violation: node name '{}' does not match URI name '{}'",
+                    node.name(),
+                    parsed.name
+                ));
+            }
+
+            if node.file_path() != parsed.file_path {
+                return Err(format!(
+                    "Integrity violation: node path '{}' does not match URI path '{}'",
+                    node.file_path(),
+                    parsed.file_path
+                ));
+            }
+
+            if node.kind().default_uri_suffix() != parsed.kind_suffix {
+                return Err(format!(
+                    "Integrity violation: node kind '{:?}' does not match URI suffix '{}'",
+                    node.kind(),
+                    parsed.kind_suffix
+                ));
+            }
+        }
+
+        if uri_seen.len() != active_nodes {
+            return Err(format!(
+                "Integrity violation: {} active nodes but {} unique URI indices",
+                active_nodes,
+                uri_seen.len()
+            ));
+        }
+
+        let mut file_seen = HashSet::with_capacity(active_nodes);
+
+        for entry in self.file_to_nodes.iter() {
+            let file_path = entry.key();
+            let indices = entry.value();
+
+            if indices.is_empty() {
+                return Err(format!(
+                    "Integrity violation: empty file index bucket for '{}'",
+                    file_path
+                ));
+            }
+
+            for &idx in indices.iter() {
+                let node = self.graph.node_weight(idx).ok_or_else(|| {
+                    format!(
+                        "Integrity violation: file index '{}' points to missing node at idx {:?}",
+                        file_path, idx
+                    )
+                })?;
+
+                if node.file_path() != file_path {
                     return Err(format!(
-                        "Integrity violation: index points to missing node at idx {:?}",
+                        "Integrity violation: file index '{}' contains node with path '{}'",
+                        file_path,
+                        node.file_path()
+                    ));
+                }
+
+                if !file_seen.insert(idx) {
+                    return Err(format!(
+                        "Integrity violation: NodeIndex {:?} appears in multiple file buckets",
                         idx
                     ));
                 }
+            }
+        }
+
+        if file_seen != uri_seen {
+            return Err(
+                "Integrity violation: file index does not contain exactly the active nodes"
+                    .to_string(),
+            );
+        }
+
+        let mut name_seen = HashSet::with_capacity(active_nodes);
+
+        for entry in self.name_index.iter() {
+            let name = entry.key();
+            let indices = entry.value();
+
+            if indices.is_empty() {
+                return Err(format!(
+                    "Integrity violation: empty name index bucket for '{}'",
+                    name
+                ));
+            }
+
+            for &idx in indices.iter() {
+                let node = self.graph.node_weight(idx).ok_or_else(|| {
+                    format!(
+                        "Integrity violation: name index '{}' points to missing node at idx {:?}",
+                        name, idx
+                    )
+                })?;
+
+                if node.name() != name {
+                    return Err(format!(
+                        "Integrity violation: name index '{}' contains node with name '{}'",
+                        name,
+                        node.name()
+                    ));
+                }
+
+                if !name_seen.insert(idx) {
+                    return Err(format!(
+                        "Integrity violation: NodeIndex {:?} appears in multiple name buckets",
+                        idx
+                    ));
+                }
+            }
+        }
+
+        if name_seen != uri_seen {
+            return Err(
+                "Integrity violation: name index does not contain exactly the active nodes"
+                    .to_string(),
+            );
+        }
+
+        for edge_idx in self.graph.edge_indices() {
+            let (source_idx, target_idx) =
+                self.graph.edge_endpoints(edge_idx).ok_or_else(|| {
+                    format!("Integrity violation: edge {:?} has no endpoints", edge_idx)
+                })?;
+
+            let source = self.graph.node_weight(source_idx).ok_or_else(|| {
+                format!(
+                    "Integrity violation: edge {:?} has missing source node {:?}",
+                    edge_idx, source_idx
+                )
+            })?;
+
+            let target = self.graph.node_weight(target_idx).ok_or_else(|| {
+                format!(
+                    "Integrity violation: edge {:?} has missing target node {:?}",
+                    edge_idx, target_idx
+                )
+            })?;
+
+            let edge = self
+                .graph
+                .edge_weight(edge_idx)
+                .ok_or_else(|| format!("Integrity violation: edge {:?} has no weight", edge_idx))?;
+
+            if edge.source_uri != *source.uri() {
+                return Err(format!(
+                    "Integrity violation: edge {:?} source URI '{}' does not match node URI '{}'",
+                    edge_idx,
+                    edge.source_uri,
+                    source.uri()
+                ));
+            }
+
+            if edge.target_uri != *target.uri() {
+                return Err(format!(
+                    "Integrity violation: edge {:?} target URI '{}' does not match node URI '{}'",
+                    edge_idx,
+                    edge.target_uri,
+                    target.uri()
+                ));
             }
         }
 
@@ -302,23 +524,45 @@ mod tests {
     use crate::model::{EdgeKind, NodeKind, SourceSpan};
 
     fn sample_node(repo: &str, file: &str, name: &str, kind: NodeKind) -> CodeEntityNode {
-        let uri = SymbolUri::new(repo, file, None, name, kind.default_uri_suffix());
-        CodeEntityNode::new(uri, name, kind, file, "rust", SourceSpan::zero())
+        let uri = SymbolUri::new(repo, file, None, name, kind.default_uri_suffix()).unwrap();
+        CodeEntityNode::try_new(uri, name, kind, file, "rust", SourceSpan::zero()).unwrap()
     }
 
     #[test]
     fn test_memory_graph_add_and_get() {
         let mut mg = MemoryGraph::new();
         let node_a = sample_node("rusty", "src/add.rs", "add_file", NodeKind::Function);
-        let uri_a = node_a.uri.clone();
+        let uri_a = node_a.uri().clone();
 
-        let idx_a = mg.add_node(node_a.clone());
+        let idx_a = mg.add_node(node_a.clone()).unwrap();
         assert_eq!(mg.node_count(), 1);
         assert_eq!(mg.get_node_index(&uri_a), Some(idx_a));
 
         let retrieved = mg.get_node_by_uri(&uri_a).unwrap();
-        assert_eq!(retrieved.name, "add_file");
-        assert_eq!(retrieved.file_path, "src/add.rs");
+        assert_eq!(retrieved.name(), "add_file");
+        assert_eq!(retrieved.file_path(), "src/add.rs");
+
+        mg.validate_integrity().expect("Graph integrity failed");
+    }
+
+    #[test]
+    fn test_memory_graph_update_existing_node_keeps_indexes_consistent() {
+        let mut mg = MemoryGraph::new();
+        let node = sample_node("rusty", "src/add.rs", "add_file", NodeKind::Function);
+        let idx = mg.add_node(node).unwrap();
+
+        let updated = sample_node("rusty", "src/add.rs", "add_file", NodeKind::Function)
+            .with_signature("pub fn add_file(path: &Path) -> Result<()>");
+
+        let updated_idx = mg.add_node(updated).unwrap();
+        assert_eq!(idx, updated_idx);
+        assert_eq!(mg.node_count(), 1);
+        assert_eq!(
+            mg.get_node(idx).unwrap().signature(),
+            Some("pub fn add_file(path: &Path) -> Result<()>")
+        );
+        assert_eq!(mg.find_nodes_by_name("add_file").len(), 1);
+        assert_eq!(mg.find_nodes_by_file("src/add.rs").len(), 1);
 
         mg.validate_integrity().expect("Graph integrity failed");
     }
@@ -328,11 +572,11 @@ mod tests {
         let mut mg = MemoryGraph::new();
         let node_a = sample_node("rusty", "src/add.rs", "add_file", NodeKind::Function);
         let node_b = sample_node("rusty", "src/index.rs", "load", NodeKind::Method);
-        let uri_a = node_a.uri.clone();
-        let uri_b = node_b.uri.clone();
+        let uri_a = node_a.uri().clone();
+        let uri_b = node_b.uri().clone();
 
-        let idx_a = mg.add_node(node_a);
-        let idx_b = mg.add_node(node_b);
+        let idx_a = mg.add_node(node_a).unwrap();
+        let idx_b = mg.add_node(node_b).unwrap();
 
         let edge = CodeEdge::new(uri_a.clone(), uri_b.clone(), EdgeKind::Calls);
         let edge_idx = mg.add_edge(edge).expect("Failed to add edge");
@@ -342,11 +586,11 @@ mod tests {
 
         let out = mg.outgoing_edges(idx_a);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0.name, "load");
+        assert_eq!(out[0].0.name(), "load");
 
         let inc = mg.incoming_edges(idx_b);
         assert_eq!(inc.len(), 1);
-        assert_eq!(inc[0].0.name, "add_file");
+        assert_eq!(inc[0].0.name(), "add_file");
 
         mg.validate_integrity().expect("Graph integrity failed");
     }
@@ -356,11 +600,11 @@ mod tests {
         let mut mg = MemoryGraph::new();
         let node_a = sample_node("rusty", "src/add.rs", "add_file", NodeKind::Function);
         let node_b = sample_node("rusty", "src/index.rs", "load", NodeKind::Method);
-        let uri_a = node_a.uri.clone();
-        let uri_b = node_b.uri.clone();
+        let uri_a = node_a.uri().clone();
+        let uri_b = node_b.uri().clone();
 
-        mg.add_node(node_a);
-        mg.add_node(node_b);
+        mg.add_node(node_a).unwrap();
+        mg.add_node(node_b).unwrap();
         mg.add_edge(CodeEdge::new(uri_a.clone(), uri_b.clone(), EdgeKind::Calls));
         assert_eq!(mg.node_count(), 2);
         assert_eq!(mg.edge_count(), 1);
@@ -373,6 +617,9 @@ mod tests {
         assert_eq!(mg.edge_count(), 0);
         assert!(mg.get_node_by_uri(&uri_a).is_none());
         assert!(mg.get_node_by_uri(&uri_b).is_some());
+        assert_eq!(mg.stats().total_files, 1);
+        assert!(!mg.file_to_nodes.contains_key("src/add.rs"));
+        assert!(!mg.name_index.contains_key("add_file"));
 
         mg.validate_integrity().expect("Graph integrity failed");
     }
@@ -382,11 +629,16 @@ mod tests {
         let mut mg = MemoryGraph::new();
         let node_1 = sample_node("rusty", "src/merge.rs", "merge", NodeKind::Function);
         let node_2 = sample_node("rusty", "src/merge.rs", "MergeState", NodeKind::Struct);
-        let node_3 = sample_node("rusty", "src/commit.rs", "create_commit", NodeKind::Function);
+        let node_3 = sample_node(
+            "rusty",
+            "src/commit.rs",
+            "create_commit",
+            NodeKind::Function,
+        );
 
-        mg.add_node(node_1);
-        mg.add_node(node_2);
-        mg.add_node(node_3);
+        mg.add_node(node_1).unwrap();
+        mg.add_node(node_2).unwrap();
+        mg.add_node(node_3).unwrap();
         assert_eq!(mg.node_count(), 3);
 
         let removed = mg.remove_nodes_by_file("src/merge.rs");
@@ -394,6 +646,8 @@ mod tests {
         assert_eq!(mg.node_count(), 1);
         assert_eq!(mg.find_nodes_by_file("src/merge.rs").len(), 0);
         assert_eq!(mg.find_nodes_by_file("src/commit.rs").len(), 1);
+        assert!(!mg.name_index.contains_key("merge"));
+        assert!(!mg.name_index.contains_key("MergeState"));
 
         mg.validate_integrity().expect("Graph integrity failed");
     }
@@ -401,14 +655,33 @@ mod tests {
     #[test]
     fn test_memory_graph_stats() {
         let mut mg = MemoryGraph::new();
-        mg.add_node(sample_node("rusty", "src/a.rs", "foo", NodeKind::Function));
-        mg.add_node(sample_node("rusty", "src/a.rs", "Bar", NodeKind::Struct));
-        mg.add_node(sample_node("rusty", "src/b.rs", "baz", NodeKind::Function));
+        mg.add_node(sample_node("rusty", "src/a.rs", "foo", NodeKind::Function))
+            .unwrap();
+        mg.add_node(sample_node("rusty", "src/a.rs", "Bar", NodeKind::Struct))
+            .unwrap();
+        mg.add_node(sample_node("rusty", "src/b.rs", "baz", NodeKind::Function))
+            .unwrap();
 
         let stats = mg.stats();
         assert_eq!(stats.total_nodes, 3);
         assert_eq!(stats.total_files, 2);
         assert_eq!(stats.total_callables, 2);
         assert_eq!(stats.total_types, 1);
+    }
+
+    #[test]
+    fn test_memory_graph_integrity_detects_stale_indexes() {
+        let mut mg = MemoryGraph::new();
+        let node = sample_node("rusty", "src/a.rs", "foo", NodeKind::Function);
+        let uri = node.uri().clone();
+        mg.add_node(node).unwrap();
+
+        // Simulate a legacy corrupt bucket: empty but still present.
+        mg.name_index.get_mut("foo").unwrap().clear();
+        assert!(mg.validate_integrity().is_err());
+
+        mg.clear();
+        assert!(mg.get_node_by_uri(&uri).is_none());
+        assert!(mg.validate_integrity().is_ok());
     }
 }

@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -43,16 +43,25 @@ fn main() -> anyhow::Result<()> {
         Commands::Init { path } => {
             let kg_dir = path.join(".kg");
             if kg_dir.exists() {
-                println!("Knowledge graph already initialized at: {}", kg_dir.display());
+                println!(
+                    "Knowledge graph already initialized at: {}",
+                    kg_dir.display()
+                );
             } else {
                 std::fs::create_dir_all(&kg_dir)?;
-                println!("Initialized empty knowledge graph repository at: {}", kg_dir.display());
+                println!(
+                    "Initialized empty knowledge graph repository at: {}",
+                    kg_dir.display()
+                );
             }
         }
         Commands::Status { path } => {
             let kg_dir = path.join(".kg");
             if !kg_dir.exists() {
-                println!("No knowledge graph found at: {}. Run 'kg init' first.", path.display());
+                println!(
+                    "No knowledge graph found at: {}. Run 'kg init' first.",
+                    path.display()
+                );
             } else {
                 println!("Knowledge graph directory active at: {}", kg_dir.display());
             }

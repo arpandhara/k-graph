@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use super::uri::SymbolUri;
+use thiserror::Error;
+
+use super::uri::{SymbolUri, UriParseError};
 
 /// Categorization of all recognized source code and architectural entities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -103,20 +105,15 @@ impl NodeKind {
 }
 
 /// The visibility or access modifier of an entity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum Visibility {
+    #[default]
     Public,
     Crate,
     ModulePrivate,
     Private,
     Protected,
     Internal,
-}
-
-impl Default for Visibility {
-    fn default() -> Self {
-        Visibility::Public
-    }
 }
 
 /// Source code location span (line and byte boundaries).
@@ -163,7 +160,9 @@ impl SourceSpan {
 
     /// Number of lines spanned by this construct.
     pub fn line_count(&self) -> u32 {
-        self.end_line.saturating_sub(self.start_line).saturating_add(1)
+        self.end_line
+            .saturating_sub(self.start_line)
+            .saturating_add(1)
     }
 }
 
@@ -177,33 +176,51 @@ pub struct VcsMetadata {
     pub last_modified_timestamp: Option<i64>,
 }
 
+/// Errors raised when a node's redundant identity fields disagree with its URI.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum NodeError {
+    #[error(transparent)]
+    InvalidUri(#[from] UriParseError),
+    #[error("node name '{actual}' does not match URI name '{expected}'")]
+    NameMismatch { expected: String, actual: String },
+    #[error("node file path '{actual}' does not match URI path '{expected}'")]
+    FilePathMismatch { expected: String, actual: String },
+    #[error("node kind '{kind:?}' does not match URI kind suffix '{suffix}'")]
+    KindMismatch { kind: NodeKind, suffix: String },
+}
+
 /// The central node representing an entity in the code knowledge graph.
+///
+/// Identity fields (`uri`, `name`, `file_path`, and `kind`) are private and can
+/// only be populated through `try_new` or Serde deserialization, both of which
+/// verify that the redundant fields agree with the canonical `SymbolUri`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "CodeEntityNodeWire")]
 pub struct CodeEntityNode {
-    pub uri: SymbolUri,
-    pub name: String,
-    pub kind: NodeKind,
-    pub file_path: String,
-    pub language: String,
-    pub visibility: Visibility,
-    pub span: SourceSpan,
-    pub signature: Option<String>,
-    pub docstring: Option<String>,
-    pub vcs: Option<VcsMetadata>,
-    pub complexity: Option<u32>,
+    uri: SymbolUri,
+    name: String,
+    kind: NodeKind,
+    file_path: String,
+    language: String,
+    visibility: Visibility,
+    span: SourceSpan,
+    signature: Option<String>,
+    docstring: Option<String>,
+    vcs: Option<VcsMetadata>,
+    complexity: Option<u32>,
 }
 
 impl CodeEntityNode {
-    /// Construct a new `CodeEntityNode`.
-    pub fn new(
+    /// Construct a new `CodeEntityNode` after validating URI identity consistency.
+    pub fn try_new(
         uri: SymbolUri,
         name: impl Into<String>,
         kind: NodeKind,
         file_path: impl Into<String>,
         language: impl Into<String>,
         span: SourceSpan,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, NodeError> {
+        let node = Self {
             uri,
             name: name.into(),
             kind,
@@ -215,7 +232,82 @@ impl CodeEntityNode {
             docstring: None,
             vcs: None,
             complexity: None,
+        };
+
+        node.validate()?;
+        Ok(node)
+    }
+
+    /// Verify that the URI and the redundant identity fields are consistent.
+    pub fn validate(&self) -> Result<(), NodeError> {
+        let parsed = self.uri.parse()?;
+
+        if parsed.name != self.name {
+            return Err(NodeError::NameMismatch {
+                expected: parsed.name,
+                actual: self.name.clone(),
+            });
         }
+
+        if parsed.file_path != self.file_path {
+            return Err(NodeError::FilePathMismatch {
+                expected: parsed.file_path,
+                actual: self.file_path.clone(),
+            });
+        }
+
+        if parsed.kind_suffix != self.kind.default_uri_suffix() {
+            return Err(NodeError::KindMismatch {
+                kind: self.kind,
+                suffix: parsed.kind_suffix,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn uri(&self) -> &SymbolUri {
+        &self.uri
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn kind(&self) -> NodeKind {
+        self.kind
+    }
+
+    pub fn file_path(&self) -> &str {
+        &self.file_path
+    }
+
+    pub fn language(&self) -> &str {
+        &self.language
+    }
+
+    pub fn visibility(&self) -> Visibility {
+        self.visibility
+    }
+
+    pub fn span(&self) -> SourceSpan {
+        self.span
+    }
+
+    pub fn signature(&self) -> Option<&str> {
+        self.signature.as_deref()
+    }
+
+    pub fn docstring(&self) -> Option<&str> {
+        self.docstring.as_deref()
+    }
+
+    pub fn vcs(&self) -> Option<&VcsMetadata> {
+        self.vcs.as_ref()
+    }
+
+    pub fn complexity(&self) -> Option<u32> {
+        self.complexity
     }
 
     /// Builder: attach signature.
@@ -249,51 +341,171 @@ impl CodeEntityNode {
     }
 }
 
+/// Wire representation used by Serde. Validation happens in `TryFrom` below so
+/// deserialization cannot bypass `CodeEntityNode::validate`.
+#[derive(Deserialize)]
+struct CodeEntityNodeWire {
+    uri: SymbolUri,
+    name: String,
+    kind: NodeKind,
+    file_path: String,
+    language: String,
+    visibility: Visibility,
+    span: SourceSpan,
+    signature: Option<String>,
+    docstring: Option<String>,
+    vcs: Option<VcsMetadata>,
+    complexity: Option<u32>,
+}
+
+impl TryFrom<CodeEntityNodeWire> for CodeEntityNode {
+    type Error = NodeError;
+
+    fn try_from(wire: CodeEntityNodeWire) -> Result<Self, Self::Error> {
+        let mut node = Self::try_new(
+            wire.uri,
+            wire.name,
+            wire.kind,
+            wire.file_path,
+            wire.language,
+            wire.span,
+        )?;
+
+        node.visibility = wire.visibility;
+        node.signature = wire.signature;
+        node.docstring = wire.docstring;
+        node.vcs = wire.vcs;
+        node.complexity = wire.complexity;
+
+        Ok(node)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_node_creation_and_builders() {
-        let uri = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn");
+        let uri = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn").unwrap();
         let span = SourceSpan::new(10, 0, 25, 1, 200, 500);
 
-        let node = CodeEntityNode::new(uri.clone(), "add_file", NodeKind::Function, "src/add.rs", "rust", span)
-            .with_signature("pub fn add_file(path: &Path, repo_path: &Path) -> Result<()>")
-            .with_visibility(Visibility::Public)
-            .with_complexity(4);
+        let node = CodeEntityNode::try_new(
+            uri.clone(),
+            "add_file",
+            NodeKind::Function,
+            "src/add.rs",
+            "rust",
+            span,
+        )
+        .unwrap()
+        .with_signature("pub fn add_file(path: &Path, repo_path: &Path) -> Result<()>")
+        .with_visibility(Visibility::Public)
+        .with_complexity(4);
 
-        assert_eq!(node.uri, uri);
-        assert_eq!(node.name, "add_file");
-        assert_eq!(node.kind, NodeKind::Function);
-        assert!(node.kind.is_callable());
-        assert_eq!(node.span.line_count(), 16);
-        assert_eq!(node.complexity, Some(4));
-        assert_eq!(node.visibility, Visibility::Public);
+        assert_eq!(node.uri(), &uri);
+        assert_eq!(node.name(), "add_file");
+        assert_eq!(node.kind(), NodeKind::Function);
+        assert!(node.kind().is_callable());
+        assert_eq!(node.span().line_count(), 16);
+        assert_eq!(node.complexity(), Some(4));
+        assert_eq!(node.visibility(), Visibility::Public);
+    }
+
+    #[test]
+    fn test_node_rejects_identity_mismatch() {
+        let uri = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn").unwrap();
+
+        assert!(
+            CodeEntityNode::try_new(
+                uri.clone(),
+                "different_name",
+                NodeKind::Function,
+                "src/add.rs",
+                "rust",
+                SourceSpan::zero(),
+            )
+            .is_err()
+        );
+
+        assert!(
+            CodeEntityNode::try_new(
+                uri.clone(),
+                "add_file",
+                NodeKind::Function,
+                "src/other.rs",
+                "rust",
+                SourceSpan::zero(),
+            )
+            .is_err()
+        );
+
+        assert!(
+            CodeEntityNode::try_new(
+                uri,
+                "add_file",
+                NodeKind::Struct,
+                "src/add.rs",
+                "rust",
+                SourceSpan::zero(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_node_serde_json_roundtrip() {
-        let uri = SymbolUri::new("rusty", "src/index.rs", Some("Index"), "load", "fn");
+        let uri = SymbolUri::new("rusty", "src/index.rs", Some("Index"), "load", "fn").unwrap();
         let span = SourceSpan::new(45, 4, 60, 5, 1200, 1600);
-        let node = CodeEntityNode::new(uri, "load", NodeKind::Method, "src/index.rs", "rust", span)
-            .with_signature("pub fn load(repo_path: &Path) -> Result<Self>")
-            .with_docstring("Load the repository staging index from disk.");
+        let node =
+            CodeEntityNode::try_new(uri, "load", NodeKind::Method, "src/index.rs", "rust", span)
+                .unwrap()
+                .with_signature("pub fn load(repo_path: &Path) -> Result<Self>")
+                .with_docstring("Load the repository staging index from disk.");
 
         let serialized = serde_json::to_string(&node).expect("JSON serialization failed");
-        let deserialized: CodeEntityNode = serde_json::from_str(&serialized).expect("JSON deserialization failed");
+        let deserialized: CodeEntityNode =
+            serde_json::from_str(&serialized).expect("JSON deserialization failed");
 
         assert_eq!(node, deserialized);
     }
 
     #[test]
+    fn test_node_deserialization_rejects_identity_mismatch() {
+        let uri = SymbolUri::new("rusty", "src/index.rs", None, "load", "fn").unwrap();
+        let node = CodeEntityNode::try_new(
+            uri,
+            "load",
+            NodeKind::Function,
+            "src/index.rs",
+            "rust",
+            SourceSpan::zero(),
+        )
+        .unwrap();
+
+        let mut value = serde_json::to_value(&node).unwrap();
+        value["name"] = serde_json::Value::String("other".to_string());
+
+        assert!(serde_json::from_value::<CodeEntityNode>(value).is_err());
+    }
+
+    #[test]
     fn test_node_bincode_roundtrip() {
-        let uri = SymbolUri::new("rusty", "src/commit.rs", None, "Commit", "struct");
+        let uri = SymbolUri::new("rusty", "src/commit.rs", None, "Commit", "struct").unwrap();
         let span = SourceSpan::new(1, 0, 20, 1, 0, 450);
-        let node = CodeEntityNode::new(uri, "Commit", NodeKind::Struct, "src/commit.rs", "rust", span);
+        let node = CodeEntityNode::try_new(
+            uri,
+            "Commit",
+            NodeKind::Struct,
+            "src/commit.rs",
+            "rust",
+            span,
+        )
+        .unwrap();
 
         let bytes = bincode::serialize(&node).expect("bincode serialization failed");
-        let deserialized: CodeEntityNode = bincode::deserialize(&bytes).expect("bincode deserialization failed");
+        let deserialized: CodeEntityNode =
+            bincode::deserialize(&bytes).expect("bincode deserialization failed");
 
         assert_eq!(node, deserialized);
     }

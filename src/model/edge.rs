@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use super::node::SourceSpan;
 use super::uri::SymbolUri;
+use serde::{Deserialize, Serialize};
 
 /// Categorization of relationships between code entities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -119,8 +119,8 @@ mod tests {
 
     #[test]
     fn test_edge_creation_and_properties() {
-        let src = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn");
-        let dst = SymbolUri::new("rusty", "src/index.rs", Some("Index"), "load", "fn");
+        let src = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn").unwrap();
+        let dst = SymbolUri::new("rusty", "src/index.rs", Some("Index"), "load", "fn").unwrap();
 
         let edge = CodeEdge::new(src.clone(), dst.clone(), EdgeKind::Calls)
             .with_confidence(0.9)
@@ -137,8 +137,8 @@ mod tests {
 
     #[test]
     fn test_edge_serde_json() {
-        let src = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn");
-        let dst = SymbolUri::new("rusty", "src/index.rs", None, "Index", "struct");
+        let src = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn").unwrap();
+        let dst = SymbolUri::new("rusty", "src/index.rs", None, "Index", "struct").unwrap();
         let edge = CodeEdge::new(src, dst, EdgeKind::TypedAs);
 
         let json = serde_json::to_string(&edge).unwrap();
@@ -148,8 +148,8 @@ mod tests {
 
     #[test]
     fn test_edge_bincode_roundtrip() {
-        let src = SymbolUri::new("rusty", "src/lib.rs", None, "lib", "file");
-        let dst = SymbolUri::new("rusty", "src/add.rs", None, "add", "file");
+        let src = SymbolUri::new("rusty", "src/lib.rs", None, "lib", "file").unwrap();
+        let dst = SymbolUri::new("rusty", "src/add.rs", None, "add", "file").unwrap();
         let edge = CodeEdge::new(src, dst, EdgeKind::DependsOn);
 
         let bytes = bincode::serialize(&edge).unwrap();

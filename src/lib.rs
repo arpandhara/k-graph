@@ -7,8 +7,8 @@ pub mod graph;
 pub mod model;
 
 // Re-export core abstractions
-pub use graph::{GraphStats, MemoryGraph};
+pub use graph::{GraphError, GraphStats, MemoryGraph};
 pub use model::{
-    CodeEdge, CodeEntityNode, EdgeKind, NodeKind, ParsedSymbolUri, SourceSpan, SymbolUri,
-    UriParseError, VcsMetadata, Visibility,
+    CodeEdge, CodeEntityNode, EdgeKind, NodeError, NodeKind, ParsedSymbolUri, SourceSpan,
+    SymbolUri, UriParseError, VcsMetadata, Visibility,
 };
