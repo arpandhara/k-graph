@@ -140,21 +140,72 @@ impl MemoryGraph {
 
     /// Add an edge between two entities using their URIs.
     ///
-    /// Returns `Some(EdgeIndex)` if both nodes exist in the graph, or `None` otherwise.
-    pub fn add_edge(&mut self, edge: CodeEdge) -> Option<EdgeIndex> {
-        let from_idx = self.get_node_index(&edge.source_uri)?;
-        let to_idx = self.get_node_index(&edge.target_uri)?;
-        Some(self.graph.add_edge(from_idx, to_idx, edge))
+    /// Both endpoints must already exist in the graph. Repeated insertion of
+    /// the same `(source, target, kind)` triple upserts the existing edge
+    /// instead of growing the graph, so re-running resolution is idempotent.
+    pub fn add_edge(&mut self, edge: CodeEdge) -> Result<EdgeIndex, GraphError> {
+        let from_idx = self
+            .get_node_index(&edge.source_uri)
+            .ok_or_else(|| GraphError::UnknownNode(edge.source_uri.clone()))?;
+        let to_idx = self
+            .get_node_index(&edge.target_uri)
+            .ok_or_else(|| GraphError::UnknownNode(edge.target_uri.clone()))?;
+
+        self.insert_edge(from_idx, to_idx, edge)
     }
 
     /// Add an edge between two entities directly by `NodeIndex`.
+    ///
+    /// Rejects vacant indices with `GraphError::MissingNode` instead of
+    /// panicking, and verifies that the edge's declared URIs match the nodes
+    /// stored at `from` and `to`.
     pub fn add_edge_by_index(
         &mut self,
         from: NodeIndex,
         to: NodeIndex,
         edge: CodeEdge,
-    ) -> EdgeIndex {
-        self.graph.add_edge(from, to, edge)
+    ) -> Result<EdgeIndex, GraphError> {
+        self.insert_edge(from, to, edge)
+    }
+
+    /// Validate endpoints and insert or upsert the edge.
+    fn insert_edge(
+        &mut self,
+        from: NodeIndex,
+        to: NodeIndex,
+        edge: CodeEdge,
+    ) -> Result<EdgeIndex, GraphError> {
+        let source_uri = self
+            .graph
+            .node_weight(from)
+            .ok_or(GraphError::MissingNode(from))?
+            .uri()
+            .clone();
+        let target_uri = self
+            .graph
+            .node_weight(to)
+            .ok_or(GraphError::MissingNode(to))?
+            .uri()
+            .clone();
+
+        if source_uri != edge.source_uri || target_uri != edge.target_uri {
+            return Err(GraphError::EdgeEndpointMismatch);
+        }
+
+        let existing = self
+            .graph
+            .edges_directed(from, Direction::Outgoing)
+            .find(|candidate| candidate.target() == to && candidate.weight().kind == edge.kind)
+            .map(|candidate| candidate.id());
+
+        if let Some(edge_idx) = existing {
+            if let Some(weight) = self.graph.edge_weight_mut(edge_idx) {
+                *weight = edge;
+            }
+            return Ok(edge_idx);
+        }
+
+        Ok(self.graph.add_edge(from, to, edge))
     }
 
     /// Retrieve an edge by its `EdgeIndex`.
@@ -470,6 +521,8 @@ impl MemoryGraph {
             );
         }
 
+        let mut edge_keys = HashSet::with_capacity(self.graph.edge_count());
+
         for edge_idx in self.graph.edge_indices() {
             let (source_idx, target_idx) =
                 self.graph.edge_endpoints(edge_idx).ok_or_else(|| {
@@ -510,6 +563,13 @@ impl MemoryGraph {
                     edge_idx,
                     edge.target_uri,
                     target.uri()
+                ));
+            }
+
+            if !edge_keys.insert((source_idx, target_idx, edge.kind)) {
+                return Err(format!(
+                    "Integrity violation: duplicate edge {:?} for ({:?}, {:?}, {:?})",
+                    edge_idx, source_idx, target_idx, edge.kind
                 ));
             }
         }
@@ -596,6 +656,131 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_graph_add_edge_rejects_unknown_uris() {
+        let mut mg = MemoryGraph::new();
+        let node_a = sample_node("rusty", "src/add.rs", "add_file", NodeKind::Function);
+        let uri_a = node_a.uri().clone();
+        mg.add_node(node_a).unwrap();
+
+        let unknown = SymbolUri::new("rusty", "src/missing.rs", None, "missing", "fn").unwrap();
+
+        let bad_source = CodeEdge::new(unknown.clone(), uri_a.clone(), EdgeKind::Calls);
+        assert!(matches!(
+            mg.add_edge(bad_source),
+            Err(GraphError::UnknownNode(uri)) if uri == unknown
+        ));
+
+        let bad_target = CodeEdge::new(uri_a, unknown.clone(), EdgeKind::Calls);
+        assert!(matches!(
+            mg.add_edge(bad_target),
+            Err(GraphError::UnknownNode(uri)) if uri == unknown
+        ));
+
+        assert_eq!(mg.edge_count(), 0);
+        mg.validate_integrity().expect("Graph integrity failed");
+    }
+
+    #[test]
+    fn test_memory_graph_add_edge_by_index_rejects_missing_endpoints() {
+        let mut mg = MemoryGraph::new();
+        let node_a = sample_node("rusty", "src/add.rs", "add_file", NodeKind::Function);
+        let uri_a = node_a.uri().clone();
+        let idx_a = mg.add_node(node_a).unwrap();
+
+        let vacant = NodeIndex::new(9_999);
+        let edge = CodeEdge::new(uri_a.clone(), uri_a.clone(), EdgeKind::Calls);
+
+        assert!(matches!(
+            mg.add_edge_by_index(idx_a, vacant, edge),
+            Err(GraphError::MissingNode(idx)) if idx == vacant
+        ));
+        assert_eq!(mg.edge_count(), 0);
+        mg.validate_integrity().expect("Graph integrity failed");
+    }
+
+    #[test]
+    fn test_memory_graph_add_edge_by_index_rejects_uri_mismatch() {
+        let mut mg = MemoryGraph::new();
+        let node_a = sample_node("rusty", "src/a.rs", "foo", NodeKind::Function);
+        let node_b = sample_node("rusty", "src/b.rs", "bar", NodeKind::Function);
+        let uri_a = node_a.uri().clone();
+        let uri_b = node_b.uri().clone();
+        let idx_a = mg.add_node(node_a).unwrap();
+        let idx_b = mg.add_node(node_b).unwrap();
+
+        // Declares `uri_a -> uri_a` while pointing at node B.
+        let mismatched = CodeEdge::new(uri_a.clone(), uri_a.clone(), EdgeKind::Calls);
+        assert!(matches!(
+            mg.add_edge_by_index(idx_a, idx_b, mismatched),
+            Err(GraphError::EdgeEndpointMismatch)
+        ));
+
+        // Declares `uri_a -> uri_b` while pointing at B -> A.
+        let reversed = CodeEdge::new(uri_a, uri_b, EdgeKind::Calls);
+        assert!(matches!(
+            mg.add_edge_by_index(idx_b, idx_a, reversed),
+            Err(GraphError::EdgeEndpointMismatch)
+        ));
+
+        assert_eq!(mg.edge_count(), 0);
+        mg.validate_integrity().expect("Graph integrity failed");
+    }
+
+    #[test]
+    fn test_memory_graph_add_edge_is_idempotent_per_kind() {
+        let mut mg = MemoryGraph::new();
+        let node_a = sample_node("rusty", "src/a.rs", "foo", NodeKind::Function);
+        let node_b = sample_node("rusty", "src/b.rs", "bar", NodeKind::Function);
+        let uri_a = node_a.uri().clone();
+        let uri_b = node_b.uri().clone();
+
+        mg.add_node(node_a).unwrap();
+        mg.add_node(node_b).unwrap();
+
+        let first = mg
+            .add_edge(CodeEdge::new(uri_a.clone(), uri_b.clone(), EdgeKind::Calls))
+            .unwrap();
+        let second = mg
+            .add_edge(
+                CodeEdge::new(uri_a.clone(), uri_b.clone(), EdgeKind::Calls).with_confidence(0.5),
+            )
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(mg.edge_count(), 1);
+        assert_eq!(mg.get_edge(second).unwrap().confidence, 0.5);
+
+        // A different relationship kind is a distinct edge.
+        let third = mg
+            .add_edge(CodeEdge::new(uri_a, uri_b, EdgeKind::Imports))
+            .unwrap();
+        assert_ne!(first, third);
+        assert_eq!(mg.edge_count(), 2);
+        assert_eq!(mg.stats().edges_by_kind.get("CALLS"), Some(&1));
+
+        mg.validate_integrity().expect("Graph integrity failed");
+    }
+
+    #[test]
+    fn test_memory_graph_integrity_detects_duplicate_edges() {
+        let mut mg = MemoryGraph::new();
+        let node_a = sample_node("rusty", "src/a.rs", "foo", NodeKind::Function);
+        let node_b = sample_node("rusty", "src/b.rs", "bar", NodeKind::Function);
+        let uri_a = node_a.uri().clone();
+        let uri_b = node_b.uri().clone();
+        let idx_a = mg.add_node(node_a).unwrap();
+        let idx_b = mg.add_node(node_b).unwrap();
+
+        let edge = CodeEdge::new(uri_a, uri_b, EdgeKind::Calls);
+        mg.add_edge(edge.clone()).unwrap();
+
+        // Bypass the public API to simulate a legacy duplicate edge.
+        mg.graph.add_edge(idx_a, idx_b, edge);
+        assert_eq!(mg.edge_count(), 2);
+        assert!(mg.validate_integrity().is_err());
+    }
+
+    #[test]
     fn test_memory_graph_remove_node_by_uri() {
         let mut mg = MemoryGraph::new();
         let node_a = sample_node("rusty", "src/add.rs", "add_file", NodeKind::Function);
@@ -605,7 +790,8 @@ mod tests {
 
         mg.add_node(node_a).unwrap();
         mg.add_node(node_b).unwrap();
-        mg.add_edge(CodeEdge::new(uri_a.clone(), uri_b.clone(), EdgeKind::Calls));
+        mg.add_edge(CodeEdge::new(uri_a.clone(), uri_b.clone(), EdgeKind::Calls))
+            .unwrap();
         assert_eq!(mg.node_count(), 2);
         assert_eq!(mg.edge_count(), 1);
 

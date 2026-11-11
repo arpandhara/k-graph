@@ -1,10 +1,11 @@
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use super::uri::{SymbolUri, UriParseError};
 
 /// Categorization of all recognized source code and architectural entities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     // Structural / Organizational
     Repository,
@@ -102,10 +103,149 @@ impl NodeKind {
             NodeKind::Constant => "const",
         }
     }
+
+    /// Stable numeric code used by binary persistence.
+    ///
+    /// These values are part of the persistence wire format and must never be
+    /// reassigned; add new variants with new codes instead.
+    pub fn stable_code(&self) -> u8 {
+        match self {
+            NodeKind::Repository => 0,
+            NodeKind::Directory => 1,
+            NodeKind::File => 2,
+            NodeKind::Module => 3,
+            NodeKind::Class => 4,
+            NodeKind::Struct => 5,
+            NodeKind::Enum => 6,
+            NodeKind::EnumVariant => 7,
+            NodeKind::Interface => 8,
+            NodeKind::Trait => 9,
+            NodeKind::TypeAlias => 10,
+            NodeKind::Function => 11,
+            NodeKind::Method => 12,
+            NodeKind::Constructor => 13,
+            NodeKind::Closure => 14,
+            NodeKind::Macro => 15,
+            NodeKind::Field => 16,
+            NodeKind::Property => 17,
+            NodeKind::GlobalVariable => 18,
+            NodeKind::Constant => 19,
+        }
+    }
+
+    /// Reconstruct a variant from its stable persistence code.
+    pub fn from_stable_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => NodeKind::Repository,
+            1 => NodeKind::Directory,
+            2 => NodeKind::File,
+            3 => NodeKind::Module,
+            4 => NodeKind::Class,
+            5 => NodeKind::Struct,
+            6 => NodeKind::Enum,
+            7 => NodeKind::EnumVariant,
+            8 => NodeKind::Interface,
+            9 => NodeKind::Trait,
+            10 => NodeKind::TypeAlias,
+            11 => NodeKind::Function,
+            12 => NodeKind::Method,
+            13 => NodeKind::Constructor,
+            14 => NodeKind::Closure,
+            15 => NodeKind::Macro,
+            16 => NodeKind::Field,
+            17 => NodeKind::Property,
+            18 => NodeKind::GlobalVariable,
+            19 => NodeKind::Constant,
+            _ => return None,
+        })
+    }
+
+    /// Stable string code used by human-readable persistence.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeKind::Repository => "repository",
+            NodeKind::Directory => "directory",
+            NodeKind::File => "file",
+            NodeKind::Module => "module",
+            NodeKind::Class => "class",
+            NodeKind::Struct => "struct",
+            NodeKind::Enum => "enum",
+            NodeKind::EnumVariant => "enum_variant",
+            NodeKind::Interface => "interface",
+            NodeKind::Trait => "trait",
+            NodeKind::TypeAlias => "type_alias",
+            NodeKind::Function => "function",
+            NodeKind::Method => "method",
+            NodeKind::Constructor => "constructor",
+            NodeKind::Closure => "closure",
+            NodeKind::Macro => "macro",
+            NodeKind::Field => "field",
+            NodeKind::Property => "property",
+            NodeKind::GlobalVariable => "global_variable",
+            NodeKind::Constant => "constant",
+        }
+    }
+
+    /// Reconstruct a variant from its stable string code.
+    pub fn from_wire_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "repository" => NodeKind::Repository,
+            "directory" => NodeKind::Directory,
+            "file" => NodeKind::File,
+            "module" => NodeKind::Module,
+            "class" => NodeKind::Class,
+            "struct" => NodeKind::Struct,
+            "enum" => NodeKind::Enum,
+            "enum_variant" => NodeKind::EnumVariant,
+            "interface" => NodeKind::Interface,
+            "trait" => NodeKind::Trait,
+            "type_alias" => NodeKind::TypeAlias,
+            "function" => NodeKind::Function,
+            "method" => NodeKind::Method,
+            "constructor" => NodeKind::Constructor,
+            "closure" => NodeKind::Closure,
+            "macro" => NodeKind::Macro,
+            "field" => NodeKind::Field,
+            "property" => NodeKind::Property,
+            "global_variable" => NodeKind::GlobalVariable,
+            "constant" => NodeKind::Constant,
+            _ => return None,
+        })
+    }
+}
+
+impl Serialize for NodeKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(self.as_str())
+        } else {
+            serializer.serialize_u8(self.stable_code())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let raw = String::deserialize(deserializer)?;
+            Self::from_wire_str(&raw)
+                .ok_or_else(|| D::Error::custom(format!("unknown NodeKind '{raw}'")))
+        } else {
+            let code = u8::deserialize(deserializer)?;
+            Self::from_stable_code(code)
+                .ok_or_else(|| D::Error::custom(format!("unknown NodeKind code {code}")))
+        }
+    }
 }
 
 /// The visibility or access modifier of an entity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Visibility {
     #[default]
     Public,
@@ -114,6 +254,88 @@ pub enum Visibility {
     Private,
     Protected,
     Internal,
+}
+
+impl Visibility {
+    /// Stable numeric code used by binary persistence.
+    pub fn stable_code(&self) -> u8 {
+        match self {
+            Visibility::Public => 0,
+            Visibility::Crate => 1,
+            Visibility::ModulePrivate => 2,
+            Visibility::Private => 3,
+            Visibility::Protected => 4,
+            Visibility::Internal => 5,
+        }
+    }
+
+    /// Reconstruct a variant from its stable persistence code.
+    pub fn from_stable_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Visibility::Public,
+            1 => Visibility::Crate,
+            2 => Visibility::ModulePrivate,
+            3 => Visibility::Private,
+            4 => Visibility::Protected,
+            5 => Visibility::Internal,
+            _ => return None,
+        })
+    }
+
+    /// Stable string code used by human-readable persistence.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Crate => "crate",
+            Visibility::ModulePrivate => "module_private",
+            Visibility::Private => "private",
+            Visibility::Protected => "protected",
+            Visibility::Internal => "internal",
+        }
+    }
+
+    /// Reconstruct a variant from its stable string code.
+    pub fn from_wire_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "public" => Visibility::Public,
+            "crate" => Visibility::Crate,
+            "module_private" => Visibility::ModulePrivate,
+            "private" => Visibility::Private,
+            "protected" => Visibility::Protected,
+            "internal" => Visibility::Internal,
+            _ => return None,
+        })
+    }
+}
+
+impl Serialize for Visibility {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(self.as_str())
+        } else {
+            serializer.serialize_u8(self.stable_code())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Visibility {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let raw = String::deserialize(deserializer)?;
+            Self::from_wire_str(&raw)
+                .ok_or_else(|| D::Error::custom(format!("unknown Visibility '{raw}'")))
+        } else {
+            let code = u8::deserialize(deserializer)?;
+            Self::from_stable_code(code)
+                .ok_or_else(|| D::Error::custom(format!("unknown Visibility code {code}")))
+        }
+    }
 }
 
 /// Source code location span (line and byte boundaries).
@@ -490,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn test_node_bincode_roundtrip() {
+    fn test_node_record_roundtrip() {
         let uri = SymbolUri::new("rusty", "src/commit.rs", None, "Commit", "struct").unwrap();
         let span = SourceSpan::new(1, 0, 20, 1, 0, 450);
         let node = CodeEntityNode::try_new(
@@ -503,9 +725,9 @@ mod tests {
         )
         .unwrap();
 
-        let bytes = bincode::serialize(&node).expect("bincode serialization failed");
+        let bytes = crate::persistence::encode_record(&node).expect("record encoding failed");
         let deserialized: CodeEntityNode =
-            bincode::deserialize(&bytes).expect("bincode deserialization failed");
+            crate::persistence::decode_record(&bytes).expect("record decoding failed");
 
         assert_eq!(node, deserialized);
     }

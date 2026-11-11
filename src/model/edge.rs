@@ -1,9 +1,10 @@
 use super::node::SourceSpan;
 use super::uri::SymbolUri;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Categorization of relationships between code entities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EdgeKind {
     // Structural / Containment
     Contains,
@@ -74,6 +75,104 @@ impl EdgeKind {
             EdgeKind::ReExports => "RE_EXPORTS",
             EdgeKind::DependsOn => "DEPENDS_ON",
             EdgeKind::CoChangedWith => "CO_CHANGED_WITH",
+        }
+    }
+
+    /// Stable numeric code used by binary persistence.
+    ///
+    /// These values are part of the persistence wire format and must never be
+    /// reassigned; add new variants with new codes instead.
+    pub fn stable_code(&self) -> u8 {
+        match self {
+            EdgeKind::Contains => 0,
+            EdgeKind::MemberOf => 1,
+            EdgeKind::Calls => 2,
+            EdgeKind::Instantiates => 3,
+            EdgeKind::Reads => 4,
+            EdgeKind::Writes => 5,
+            EdgeKind::Implements => 6,
+            EdgeKind::Extends => 7,
+            EdgeKind::ReturnsType => 8,
+            EdgeKind::AcceptsType => 9,
+            EdgeKind::TypedAs => 10,
+            EdgeKind::Imports => 11,
+            EdgeKind::ReExports => 12,
+            EdgeKind::DependsOn => 13,
+            EdgeKind::CoChangedWith => 14,
+        }
+    }
+
+    /// Reconstruct a variant from its stable persistence code.
+    pub fn from_stable_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => EdgeKind::Contains,
+            1 => EdgeKind::MemberOf,
+            2 => EdgeKind::Calls,
+            3 => EdgeKind::Instantiates,
+            4 => EdgeKind::Reads,
+            5 => EdgeKind::Writes,
+            6 => EdgeKind::Implements,
+            7 => EdgeKind::Extends,
+            8 => EdgeKind::ReturnsType,
+            9 => EdgeKind::AcceptsType,
+            10 => EdgeKind::TypedAs,
+            11 => EdgeKind::Imports,
+            12 => EdgeKind::ReExports,
+            13 => EdgeKind::DependsOn,
+            14 => EdgeKind::CoChangedWith,
+            _ => return None,
+        })
+    }
+
+    /// Reconstruct a variant from its stable string code.
+    pub fn from_wire_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "CONTAINS" => EdgeKind::Contains,
+            "MEMBER_OF" => EdgeKind::MemberOf,
+            "CALLS" => EdgeKind::Calls,
+            "INSTANTIATES" => EdgeKind::Instantiates,
+            "READS" => EdgeKind::Reads,
+            "WRITES" => EdgeKind::Writes,
+            "IMPLEMENTS" => EdgeKind::Implements,
+            "EXTENDS" => EdgeKind::Extends,
+            "RETURNS_TYPE" => EdgeKind::ReturnsType,
+            "ACCEPTS_TYPE" => EdgeKind::AcceptsType,
+            "TYPED_AS" => EdgeKind::TypedAs,
+            "IMPORTS" => EdgeKind::Imports,
+            "RE_EXPORTS" => EdgeKind::ReExports,
+            "DEPENDS_ON" => EdgeKind::DependsOn,
+            "CO_CHANGED_WITH" => EdgeKind::CoChangedWith,
+            _ => return None,
+        })
+    }
+}
+
+impl Serialize for EdgeKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(self.as_str())
+        } else {
+            serializer.serialize_u8(self.stable_code())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EdgeKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let raw = String::deserialize(deserializer)?;
+            Self::from_wire_str(&raw)
+                .ok_or_else(|| D::Error::custom(format!("unknown EdgeKind '{raw}'")))
+        } else {
+            let code = u8::deserialize(deserializer)?;
+            Self::from_stable_code(code)
+                .ok_or_else(|| D::Error::custom(format!("unknown EdgeKind code {code}")))
         }
     }
 }
@@ -147,13 +246,13 @@ mod tests {
     }
 
     #[test]
-    fn test_edge_bincode_roundtrip() {
+    fn test_edge_record_roundtrip() {
         let src = SymbolUri::new("rusty", "src/lib.rs", None, "lib", "file").unwrap();
         let dst = SymbolUri::new("rusty", "src/add.rs", None, "add", "file").unwrap();
         let edge = CodeEdge::new(src, dst, EdgeKind::DependsOn);
 
-        let bytes = bincode::serialize(&edge).unwrap();
-        let decoded: CodeEdge = bincode::deserialize(&bytes).unwrap();
+        let bytes = crate::persistence::encode_record(&edge).unwrap();
+        let decoded: CodeEdge = crate::persistence::decode_record(&bytes).unwrap();
         assert_eq!(edge, decoded);
     }
 }
