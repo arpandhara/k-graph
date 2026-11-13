@@ -1,5 +1,6 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::sync::Arc;
 use thiserror::Error;
 
 use super::uri::{SymbolUri, UriParseError};
@@ -338,18 +339,35 @@ impl<'de> Deserialize<'de> for Visibility {
     }
 }
 
+/// Errors raised when a source span is internally inconsistent.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SpanError {
+    #[error("span start_line {start} is after end_line {end}")]
+    InvertedLines { start: u32, end: u32 },
+    #[error("span start_col {start} is after end_col {end} on line {line}")]
+    InvertedColumns { line: u32, start: u32, end: u32 },
+    #[error("span byte_start {start} is after byte_end {end}")]
+    InvertedBytes { start: usize, end: usize },
+}
+
 /// Source code location span (line and byte boundaries).
+///
+/// Fields are private. `new` and Serde deserialization both run
+/// [`SourceSpan::validate`], so an inverted span cannot be represented in a
+/// well-formed value (KG-09).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "SourceSpanWire")]
 pub struct SourceSpan {
-    pub start_line: u32,
-    pub start_col: u32,
-    pub end_line: u32,
-    pub end_col: u32,
-    pub byte_start: usize,
-    pub byte_end: usize,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+    byte_start: usize,
+    byte_end: usize,
 }
 
 impl SourceSpan {
+    /// Construct a span, rejecting inverted line, column, or byte ranges.
     pub fn new(
         start_line: u32,
         start_col: u32,
@@ -357,15 +375,17 @@ impl SourceSpan {
         end_col: u32,
         byte_start: usize,
         byte_end: usize,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, SpanError> {
+        let span = Self {
             start_line,
             start_col,
             end_line,
             end_col,
             byte_start,
             byte_end,
-        }
+        };
+        span.validate()?;
+        Ok(span)
     }
 
     /// Point span for whole-file or synthetic nodes.
@@ -380,11 +400,89 @@ impl SourceSpan {
         }
     }
 
+    /// Verify that the range is ordered from start to end.
+    pub fn validate(&self) -> Result<(), SpanError> {
+        if self.start_line > self.end_line {
+            return Err(SpanError::InvertedLines {
+                start: self.start_line,
+                end: self.end_line,
+            });
+        }
+
+        if self.start_line == self.end_line && self.start_col > self.end_col {
+            return Err(SpanError::InvertedColumns {
+                line: self.start_line,
+                start: self.start_col,
+                end: self.end_col,
+            });
+        }
+
+        if self.byte_start > self.byte_end {
+            return Err(SpanError::InvertedBytes {
+                start: self.byte_start,
+                end: self.byte_end,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn start_line(&self) -> u32 {
+        self.start_line
+    }
+
+    pub fn start_col(&self) -> u32 {
+        self.start_col
+    }
+
+    pub fn end_line(&self) -> u32 {
+        self.end_line
+    }
+
+    pub fn end_col(&self) -> u32 {
+        self.end_col
+    }
+
+    pub fn byte_start(&self) -> usize {
+        self.byte_start
+    }
+
+    pub fn byte_end(&self) -> usize {
+        self.byte_end
+    }
+
     /// Number of lines spanned by this construct.
     pub fn line_count(&self) -> u32 {
         self.end_line
             .saturating_sub(self.start_line)
             .saturating_add(1)
+    }
+}
+
+/// Wire representation used by Serde so deserialization cannot bypass span
+/// ordering validation.
+#[derive(Deserialize)]
+struct SourceSpanWire {
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+impl TryFrom<SourceSpanWire> for SourceSpan {
+    type Error = SpanError;
+
+    fn try_from(wire: SourceSpanWire) -> Result<Self, Self::Error> {
+        Self::new(
+            wire.start_line,
+            wire.start_col,
+            wire.end_line,
+            wire.end_col,
+            wire.byte_start,
+            wire.byte_end,
+        )
     }
 }
 
@@ -420,10 +518,10 @@ pub enum NodeError {
 #[serde(try_from = "CodeEntityNodeWire")]
 pub struct CodeEntityNode {
     uri: SymbolUri,
-    name: String,
+    name: Arc<str>,
     kind: NodeKind,
-    file_path: String,
-    language: String,
+    file_path: Arc<str>,
+    language: Arc<str>,
     visibility: Visibility,
     span: SourceSpan,
     signature: Option<String>,
@@ -444,10 +542,10 @@ impl CodeEntityNode {
     ) -> Result<Self, NodeError> {
         let node = Self {
             uri,
-            name: name.into(),
+            name: Arc::from(name.into()),
             kind,
-            file_path: file_path.into(),
-            language: language.into(),
+            file_path: Arc::from(file_path.into()),
+            language: Arc::from(language.into()),
             visibility: Visibility::default(),
             span,
             signature: None,
@@ -464,17 +562,17 @@ impl CodeEntityNode {
     pub fn validate(&self) -> Result<(), NodeError> {
         let parsed = self.uri.parse()?;
 
-        if parsed.name != self.name {
+        if parsed.name.as_str() != self.name.as_ref() {
             return Err(NodeError::NameMismatch {
                 expected: parsed.name,
-                actual: self.name.clone(),
+                actual: self.name.to_string(),
             });
         }
 
-        if parsed.file_path != self.file_path {
+        if parsed.file_path.as_str() != self.file_path.as_ref() {
             return Err(NodeError::FilePathMismatch {
                 expected: parsed.file_path,
-                actual: self.file_path.clone(),
+                actual: self.file_path.to_string(),
             });
         }
 
@@ -502,6 +600,17 @@ impl CodeEntityNode {
 
     pub fn file_path(&self) -> &str {
         &self.file_path
+    }
+
+    /// Shared handle to the interned name, used by graph indexes so the name
+    /// string is not copied per bucket (KG-06).
+    pub(crate) fn name_shared(&self) -> Arc<str> {
+        Arc::clone(&self.name)
+    }
+
+    /// Shared handle to the interned file path, used by graph indexes.
+    pub(crate) fn file_path_shared(&self) -> Arc<str> {
+        Arc::clone(&self.file_path)
     }
 
     pub fn language(&self) -> &str {
@@ -610,7 +719,7 @@ mod tests {
     #[test]
     fn test_node_creation_and_builders() {
         let uri = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn").unwrap();
-        let span = SourceSpan::new(10, 0, 25, 1, 200, 500);
+        let span = SourceSpan::new(10, 0, 25, 1, 200, 500).unwrap();
 
         let node = CodeEntityNode::try_new(
             uri.clone(),
@@ -678,7 +787,7 @@ mod tests {
     #[test]
     fn test_node_serde_json_roundtrip() {
         let uri = SymbolUri::new("rusty", "src/index.rs", Some("Index"), "load", "fn").unwrap();
-        let span = SourceSpan::new(45, 4, 60, 5, 1200, 1600);
+        let span = SourceSpan::new(45, 4, 60, 5, 1200, 1600).unwrap();
         let node =
             CodeEntityNode::try_new(uri, "load", NodeKind::Method, "src/index.rs", "rust", span)
                 .unwrap()
@@ -712,9 +821,48 @@ mod tests {
     }
 
     #[test]
+    fn test_source_span_rejects_inverted_ranges_and_exposes_components() {
+        assert!(SourceSpan::new(20, 0, 10, 0, 500, 200).is_err());
+        assert!(SourceSpan::new(5, 10, 5, 2, 0, 10).is_err());
+        assert!(SourceSpan::new(1, 0, 2, 0, 100, 50).is_err());
+
+        let span = SourceSpan::new(1, 2, 4, 5, 10, 90).unwrap();
+        assert_eq!(span.start_line(), 1);
+        assert_eq!(span.start_col(), 2);
+        assert_eq!(span.end_line(), 4);
+        assert_eq!(span.end_col(), 5);
+        assert_eq!(span.byte_start(), 10);
+        assert_eq!(span.byte_end(), 90);
+        assert_eq!(span.line_count(), 4);
+    }
+
+    #[test]
+    fn test_source_span_deserialization_rejects_inverted_ranges() {
+        let valid = serde_json::json!({
+            "start_line": 1,
+            "start_col": 0,
+            "end_line": 2,
+            "end_col": 0,
+            "byte_start": 0,
+            "byte_end": 10
+        });
+        assert!(serde_json::from_value::<SourceSpan>(valid).is_ok());
+
+        let inverted = serde_json::json!({
+            "start_line": 10,
+            "start_col": 0,
+            "end_line": 2,
+            "end_col": 0,
+            "byte_start": 0,
+            "byte_end": 10
+        });
+        assert!(serde_json::from_value::<SourceSpan>(inverted).is_err());
+    }
+
+    #[test]
     fn test_node_record_roundtrip() {
         let uri = SymbolUri::new("rusty", "src/commit.rs", None, "Commit", "struct").unwrap();
-        let span = SourceSpan::new(1, 0, 20, 1, 0, 450);
+        let span = SourceSpan::new(1, 0, 20, 1, 0, 450).unwrap();
         let node = CodeEntityNode::try_new(
             uri,
             "Commit",

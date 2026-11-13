@@ -124,15 +124,16 @@ impl ValidateRecord for CodeEntityNode {
 
 impl ValidateRecord for CodeEdge {
     fn validate_record(&self) -> Result<(), String> {
-        if !self.confidence.is_finite() || !(0.0..=1.0).contains(&self.confidence) {
+        let confidence = self.confidence().value();
+        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
             return Err(format!(
                 "edge confidence {} is not finite or is outside [0.0, 1.0]",
-                self.confidence
+                confidence
             ));
         }
 
-        if let Some(span) = &self.call_site {
-            validate_span(span, "edge call_site")?;
+        if let Some(span) = self.call_site() {
+            validate_span(&span, "edge call_site")?;
         }
 
         Ok(())
@@ -140,28 +141,7 @@ impl ValidateRecord for CodeEdge {
 }
 
 fn validate_span(span: &SourceSpan, label: &str) -> Result<(), String> {
-    if span.start_line > span.end_line {
-        return Err(format!(
-            "{label} start_line {} is after end_line {}",
-            span.start_line, span.end_line
-        ));
-    }
-
-    if span.start_line == span.end_line && span.start_col > span.end_col {
-        return Err(format!(
-            "{label} start_col {} is after end_col {} on line {}",
-            span.start_col, span.end_col, span.start_line
-        ));
-    }
-
-    if span.byte_start > span.byte_end {
-        return Err(format!(
-            "{label} byte_start {} is after byte_end {}",
-            span.byte_start, span.byte_end
-        ));
-    }
-
-    Ok(())
+    span.validate().map_err(|err| format!("{label} {err}"))
 }
 
 #[cfg(test)]
@@ -177,7 +157,7 @@ mod tests {
             NodeKind::Function,
             "src/add.rs",
             "rust",
-            SourceSpan::new(10, 0, 25, 1, 200, 500),
+            SourceSpan::new(10, 0, 25, 1, 200, 500).unwrap(),
         )
         .unwrap()
         .with_signature("pub fn add_file(path: &Path) -> Result<()>")
@@ -189,7 +169,40 @@ mod tests {
         let target = SymbolUri::new("rusty", "src/index.rs", Some("Index"), "load", "fn").unwrap();
         CodeEdge::new(source, target, EdgeKind::Calls)
             .with_confidence(0.75)
-            .with_call_site(SourceSpan::new(12, 18, 12, 33, 250, 265))
+            .unwrap()
+            .with_call_site(SourceSpan::new(12, 18, 12, 33, 250, 265).unwrap())
+    }
+
+    /// Raw wire shape used to build records that bypass the validating
+    /// constructors, so decode-time rejection can be tested.
+    #[derive(Serialize)]
+    struct RawSpan {
+        start_line: u32,
+        start_col: u32,
+        end_line: u32,
+        end_col: u32,
+        byte_start: usize,
+        byte_end: usize,
+    }
+
+    #[derive(Serialize)]
+    struct RawEdge {
+        source_uri: SymbolUri,
+        target_uri: SymbolUri,
+        kind: EdgeKind,
+        confidence: f32,
+        call_site: Option<RawSpan>,
+    }
+
+    fn raw_edge(confidence: f32, call_site: Option<RawSpan>) -> RawEdge {
+        let edge = sample_edge();
+        RawEdge {
+            source_uri: edge.source_uri().clone(),
+            target_uri: edge.target_uri().clone(),
+            kind: edge.kind(),
+            confidence,
+            call_site,
+        }
     }
 
     #[test]
@@ -255,43 +268,50 @@ mod tests {
 
     #[test]
     fn test_decode_rejects_nan_confidence() {
-        let mut edge = sample_edge();
-        edge.confidence = f32::NAN;
         let envelope = RecordEnvelope {
             schema_version: SCHEMA_VERSION,
-            payload: edge,
+            payload: raw_edge(f32::NAN, None),
         };
         let bytes = options().serialize(&envelope).unwrap();
 
+        // `Confidence` rejects the value during deserialization, so the record
+        // never reaches payload validation.
         assert!(matches!(
             decode_record::<CodeEdge>(&bytes),
-            Err(CodecError::InvalidRecord(_))
+            Err(CodecError::Decode(_))
         ));
     }
 
     #[test]
     fn test_decode_rejects_inverted_span() {
-        let mut edge = sample_edge();
-        edge.call_site = Some(SourceSpan::new(20, 0, 10, 0, 500, 200));
+        let inverted = RawSpan {
+            start_line: 20,
+            start_col: 0,
+            end_line: 10,
+            end_col: 0,
+            byte_start: 500,
+            byte_end: 200,
+        };
         let envelope = RecordEnvelope {
             schema_version: SCHEMA_VERSION,
-            payload: edge,
+            payload: raw_edge(0.5, Some(inverted)),
         };
         let bytes = options().serialize(&envelope).unwrap();
 
+        // `SourceSpan` rejects the order during deserialization.
         assert!(matches!(
             decode_record::<CodeEdge>(&bytes),
-            Err(CodecError::InvalidRecord(_))
+            Err(CodecError::Decode(_))
         ));
     }
 
     #[test]
-    fn test_encode_refuses_invalid_payload() {
-        let mut edge = sample_edge();
-        edge.confidence = -0.5;
+    fn test_decode_rejects_trailing_bytes_after_valid_record() {
+        let mut bytes = encode_record(&sample_edge()).unwrap();
+        bytes.extend_from_slice(b"extra");
         assert!(matches!(
-            encode_record(&edge),
-            Err(CodecError::InvalidRecord(_))
+            decode_record::<CodeEdge>(&bytes),
+            Err(CodecError::Decode(_))
         ));
     }
 

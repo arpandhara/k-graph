@@ -2,6 +2,7 @@ use super::node::SourceSpan;
 use super::uri::SymbolUri;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use thiserror::Error;
 
 /// Categorization of relationships between code entities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -177,14 +178,91 @@ impl<'de> Deserialize<'de> for EdgeKind {
     }
 }
 
+/// Errors raised when constructing edge metadata.
+#[derive(Debug, Error, PartialEq)]
+pub enum EdgeError {
+    #[error("confidence {0} is not a finite value in [0.0, 1.0]")]
+    InvalidConfidence(f32),
+}
+
+/// A confidence score guaranteed to be finite and within `[0.0, 1.0]`.
+///
+/// `f32::clamp` propagates `NaN`, which is why this type validates instead of
+/// relying on clamping alone (KG-09).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Confidence(f32);
+
+impl Confidence {
+    /// Maximum confidence (certain relationship).
+    pub const CERTAIN: Self = Self(1.0);
+
+    /// Construct a confidence after rejecting `NaN`, infinities, and values
+    /// outside `[0.0, 1.0]`.
+    pub fn new(value: f32) -> Result<Self, EdgeError> {
+        if value.is_finite() && (0.0..=1.0).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(EdgeError::InvalidConfidence(value))
+        }
+    }
+
+    /// The validated `f32` value.
+    pub fn value(self) -> f32 {
+        self.0
+    }
+}
+
+impl Default for Confidence {
+    fn default() -> Self {
+        Self::CERTAIN
+    }
+}
+
+impl TryFrom<f32> for Confidence {
+    type Error = EdgeError;
+
+    fn try_from(value: f32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<Confidence> for f32 {
+    fn from(value: Confidence) -> Self {
+        value.0
+    }
+}
+
+impl Serialize for Confidence {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f32(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Confidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = f32::deserialize(deserializer)?;
+        Self::new(raw).map_err(D::Error::custom)
+    }
+}
+
 /// A directed edge connecting two entities in the knowledge graph.
+///
+/// All fields are private. An edge can only be built through [`CodeEdge::new`]
+/// or validated Serde deserialization, so an out-of-range confidence or an
+/// inverted call-site span cannot be represented (KG-09).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeEdge {
-    pub source_uri: SymbolUri,
-    pub target_uri: SymbolUri,
-    pub kind: EdgeKind,
-    pub confidence: f32,
-    pub call_site: Option<SourceSpan>,
+    source_uri: SymbolUri,
+    target_uri: SymbolUri,
+    kind: EdgeKind,
+    confidence: Confidence,
+    call_site: Option<SourceSpan>,
 }
 
 impl CodeEdge {
@@ -194,21 +272,44 @@ impl CodeEdge {
             source_uri,
             target_uri,
             kind,
-            confidence: 1.0,
+            confidence: Confidence::CERTAIN,
             call_site: None,
         }
     }
 
     /// Builder: assign confidence score (between 0.0 and 1.0).
-    pub fn with_confidence(mut self, confidence: f32) -> Self {
-        self.confidence = confidence.clamp(0.0, 1.0);
-        self
+    ///
+    /// Returns [`EdgeError::InvalidConfidence`] for `NaN`, infinities, and
+    /// values outside the range.
+    pub fn with_confidence(mut self, confidence: f32) -> Result<Self, EdgeError> {
+        self.confidence = Confidence::new(confidence)?;
+        Ok(self)
     }
 
     /// Builder: attach the source span where this relationship occurred.
     pub fn with_call_site(mut self, span: SourceSpan) -> Self {
         self.call_site = Some(span);
         self
+    }
+
+    pub fn source_uri(&self) -> &SymbolUri {
+        &self.source_uri
+    }
+
+    pub fn target_uri(&self) -> &SymbolUri {
+        &self.target_uri
+    }
+
+    pub fn kind(&self) -> EdgeKind {
+        self.kind
+    }
+
+    pub fn confidence(&self) -> Confidence {
+        self.confidence
+    }
+
+    pub fn call_site(&self) -> Option<SourceSpan> {
+        self.call_site
     }
 }
 
@@ -223,15 +324,28 @@ mod tests {
 
         let edge = CodeEdge::new(src.clone(), dst.clone(), EdgeKind::Calls)
             .with_confidence(0.9)
-            .with_call_site(SourceSpan::new(12, 18, 12, 33, 250, 265));
+            .unwrap()
+            .with_call_site(SourceSpan::new(12, 18, 12, 33, 250, 265).unwrap());
 
-        assert_eq!(edge.source_uri, src);
-        assert_eq!(edge.target_uri, dst);
-        assert_eq!(edge.kind, EdgeKind::Calls);
-        assert!(edge.kind.is_invocation());
-        assert!(!edge.kind.is_structural());
-        assert_eq!(edge.confidence, 0.9);
-        assert!(edge.call_site.is_some());
+        assert_eq!(edge.source_uri(), &src);
+        assert_eq!(edge.target_uri(), &dst);
+        assert_eq!(edge.kind(), EdgeKind::Calls);
+        assert!(edge.kind().is_invocation());
+        assert!(!edge.kind().is_structural());
+        assert_eq!(edge.confidence().value(), 0.9);
+        assert!(edge.call_site().is_some());
+    }
+
+    #[test]
+    fn test_confidence_rejects_nan_and_out_of_range_values() {
+        assert!(Confidence::new(f32::NAN).is_err());
+        assert!(Confidence::new(f32::INFINITY).is_err());
+        assert!(Confidence::new(f32::NEG_INFINITY).is_err());
+        assert!(Confidence::new(-0.5).is_err());
+        assert!(Confidence::new(1.5).is_err());
+        assert_eq!(Confidence::new(0.0).unwrap().value(), 0.0);
+        assert_eq!(Confidence::new(1.0).unwrap().value(), 1.0);
+        assert_eq!(Confidence::default().value(), 1.0);
     }
 
     #[test]
@@ -243,6 +357,21 @@ mod tests {
         let json = serde_json::to_string(&edge).unwrap();
         let decoded: CodeEdge = serde_json::from_str(&json).unwrap();
         assert_eq!(edge, decoded);
+    }
+
+    #[test]
+    fn test_edge_deserialization_rejects_invalid_confidence() {
+        let src = SymbolUri::new("rusty", "src/add.rs", None, "add_file", "fn").unwrap();
+        let dst = SymbolUri::new("rusty", "src/index.rs", None, "load", "fn").unwrap();
+        let edge = CodeEdge::new(src, dst, EdgeKind::Calls);
+
+        let mut value = serde_json::to_value(&edge).unwrap();
+        value["confidence"] = serde_json::json!(f32::NAN);
+        assert!(serde_json::from_value::<CodeEdge>(value).is_err());
+
+        let mut value = serde_json::to_value(&edge).unwrap();
+        value["confidence"] = serde_json::json!(-0.1);
+        assert!(serde_json::from_value::<CodeEdge>(value).is_err());
     }
 
     #[test]

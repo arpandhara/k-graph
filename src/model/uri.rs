@@ -1,6 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Errors that can occur when constructing or parsing a SymbolUri.
@@ -45,8 +46,12 @@ pub struct ParsedSymbolUri {
 ///
 /// The inner string is private and every construction path validates the
 /// grammar, normalizes the kind suffix to lowercase, and rejects path traversal.
+///
+/// The canonical text is stored in an `Arc<str>` so cloning a URI (for example
+/// when the same symbol is referenced by many edges) only increments a
+/// reference count instead of copying the string (KG-06).
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-pub struct SymbolUri(String);
+pub struct SymbolUri(Arc<str>);
 
 impl SymbolUri {
     /// Create a new `SymbolUri` from individual symbol components.
@@ -78,10 +83,10 @@ impl SymbolUri {
             None => format!("{}:{}", clean_name, clean_kind),
         };
 
-        Ok(Self(format!(
+        Ok(Self(Arc::from(format!(
             "sym://{}/{}#{}",
             clean_repo, clean_path, fragment
-        )))
+        ))))
     }
 
     /// Helper to construct a URI representing a whole file.
@@ -303,10 +308,10 @@ impl FromStr for SymbolUri {
             None => format!("{}:{}", parsed.name, parsed.kind_suffix),
         };
 
-        Ok(Self(format!(
+        Ok(Self(Arc::from(format!(
             "sym://{}/{}#{}",
             parsed.repo, parsed.file_path, fragment
-        )))
+        ))))
     }
 }
 
@@ -388,11 +393,11 @@ mod tests {
 
     #[test]
     fn test_uri_invalid_parsing() {
-        assert!(SymbolUri("http://foo.bar".to_string()).parse().is_err());
-        assert!(SymbolUri("sym://repo".to_string()).parse().is_err());
-        assert!(SymbolUri("sym://repo/file.rs".to_string()).parse().is_err());
+        assert!(SymbolUri(Arc::from("http://foo.bar")).parse().is_err());
+        assert!(SymbolUri(Arc::from("sym://repo")).parse().is_err());
+        assert!(SymbolUri(Arc::from("sym://repo/file.rs")).parse().is_err());
         assert!(
-            SymbolUri("sym://repo/file.rs#symbol".to_string())
+            SymbolUri(Arc::from("sym://repo/file.rs#symbol"))
                 .parse()
                 .is_err()
         );
@@ -423,7 +428,7 @@ mod tests {
         assert_eq!(uri.file_path().unwrap(), "src/add.rs");
         assert_eq!(uri.name().unwrap(), "add_file");
 
-        let broken = SymbolUri("not-a-uri".to_string());
+        let broken = SymbolUri(Arc::from("not-a-uri"));
         assert!(broken.repo().is_err());
         assert!(broken.file_path().is_err());
         assert!(broken.name().is_err());

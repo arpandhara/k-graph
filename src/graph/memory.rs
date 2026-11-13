@@ -4,7 +4,9 @@ use petgraph::stable_graph::{EdgeIndex, NodeIndex, StableDiGraph};
 use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use super::edge::GraphEdge;
 use super::error::GraphError;
 use crate::model::{CodeEdge, CodeEntityNode, SymbolUri};
 
@@ -29,14 +31,16 @@ pub struct GraphStats {
 /// indices and the redundant identity fields on `CodeEntityNode` stay consistent.
 #[derive(Clone)]
 pub struct MemoryGraph {
-    /// Underlying directed graph with stable indices.
-    graph: StableDiGraph<CodeEntityNode, CodeEdge>,
+    /// Underlying directed graph with stable indices. Edge weights are
+    /// `GraphEdge` (no endpoint URIs); the endpoints live in petgraph and their
+    /// identities are available from the node weights.
+    graph: StableDiGraph<CodeEntityNode, GraphEdge>,
     /// URI -> NodeIndex index
     uri_to_node: DashMap<SymbolUri, NodeIndex>,
-    /// File path -> NodeIndices in that file
-    file_to_nodes: DashMap<String, Vec<NodeIndex>>,
-    /// Unqualified symbol name -> NodeIndices matching that name
-    name_index: DashMap<String, Vec<NodeIndex>>,
+    /// Interned file path -> NodeIndices in that file
+    file_to_nodes: DashMap<Arc<str>, Arc<Vec<NodeIndex>>>,
+    /// Interned unqualified symbol name -> NodeIndices matching that name
+    name_index: DashMap<Arc<str>, Arc<Vec<NodeIndex>>>,
 }
 
 impl Default for MemoryGraph {
@@ -67,7 +71,7 @@ impl MemoryGraph {
     }
 
     /// Read-only access to the underlying graph.
-    pub fn graph(&self) -> &StableDiGraph<CodeEntityNode, CodeEdge> {
+    pub fn graph(&self) -> &StableDiGraph<CodeEntityNode, GraphEdge> {
         &self.graph
     }
 
@@ -80,26 +84,21 @@ impl MemoryGraph {
         node.validate()?;
 
         let uri = node.uri().clone();
-        let name = node.name().to_string();
-        let file_path = node.file_path().to_string();
+        let name = node.name_shared();
+        let file_path = node.file_path_shared();
 
         if let Some(existing_idx) = self.uri_to_node.get(&uri).map(|entry| *entry) {
-            let existing_name = {
+            let (existing_name, existing_file) = {
                 let existing = self
                     .graph
                     .node_weight(existing_idx)
                     .ok_or(GraphError::MissingNode(existing_idx))?;
-                existing.name().to_string()
-            };
-            let existing_file = {
-                let existing = self
-                    .graph
-                    .node_weight(existing_idx)
-                    .ok_or(GraphError::MissingNode(existing_idx))?;
-                existing.file_path().to_string()
+                (existing.name_shared(), existing.file_path_shared())
             };
 
-            if existing_name != name || existing_file != file_path {
+            if existing_name.as_ref() != name.as_ref()
+                || existing_file.as_ref() != file_path.as_ref()
+            {
                 return Err(GraphError::IdentityMismatch);
             }
 
@@ -114,9 +113,15 @@ impl MemoryGraph {
         let idx = self.graph.add_node(node);
         self.uri_to_node.insert(uri, idx);
 
-        self.file_to_nodes.entry(file_path).or_default().push(idx);
+        {
+            let mut bucket = self.file_to_nodes.entry(file_path).or_default();
+            Arc::make_mut(bucket.value_mut()).push(idx);
+        }
 
-        self.name_index.entry(name).or_default().push(idx);
+        {
+            let mut bucket = self.name_index.entry(name).or_default();
+            Arc::make_mut(bucket.value_mut()).push(idx);
+        }
 
         Ok(idx)
     }
@@ -145,11 +150,11 @@ impl MemoryGraph {
     /// instead of growing the graph, so re-running resolution is idempotent.
     pub fn add_edge(&mut self, edge: CodeEdge) -> Result<EdgeIndex, GraphError> {
         let from_idx = self
-            .get_node_index(&edge.source_uri)
-            .ok_or_else(|| GraphError::UnknownNode(edge.source_uri.clone()))?;
+            .get_node_index(edge.source_uri())
+            .ok_or_else(|| GraphError::UnknownNode(edge.source_uri().clone()))?;
         let to_idx = self
-            .get_node_index(&edge.target_uri)
-            .ok_or_else(|| GraphError::UnknownNode(edge.target_uri.clone()))?;
+            .get_node_index(edge.target_uri())
+            .ok_or_else(|| GraphError::UnknownNode(edge.target_uri().clone()))?;
 
         self.insert_edge(from_idx, to_idx, edge)
     }
@@ -188,28 +193,32 @@ impl MemoryGraph {
             .uri()
             .clone();
 
-        if source_uri != edge.source_uri || target_uri != edge.target_uri {
+        if source_uri != *edge.source_uri() || target_uri != *edge.target_uri() {
             return Err(GraphError::EdgeEndpointMismatch);
         }
+
+        let graph_edge = GraphEdge::from_code_edge(&edge, from, to);
 
         let existing = self
             .graph
             .edges_directed(from, Direction::Outgoing)
-            .find(|candidate| candidate.target() == to && candidate.weight().kind == edge.kind)
+            .find(|candidate| {
+                candidate.target() == to && candidate.weight().kind() == graph_edge.kind()
+            })
             .map(|candidate| candidate.id());
 
         if let Some(edge_idx) = existing {
             if let Some(weight) = self.graph.edge_weight_mut(edge_idx) {
-                *weight = edge;
+                *weight = graph_edge;
             }
             return Ok(edge_idx);
         }
 
-        Ok(self.graph.add_edge(from, to, edge))
+        Ok(self.graph.add_edge(from, to, graph_edge))
     }
 
     /// Retrieve an edge by its `EdgeIndex`.
-    pub fn get_edge(&self, idx: EdgeIndex) -> Option<&CodeEdge> {
+    pub fn get_edge(&self, idx: EdgeIndex) -> Option<&GraphEdge> {
         self.graph.edge_weight(idx)
     }
 
@@ -221,11 +230,11 @@ impl MemoryGraph {
         };
 
         if let Some(node) = self.graph.node_weight(idx) {
-            let file_path = node.file_path().to_string();
-            let name = node.name().to_string();
+            let file_path = node.file_path_shared();
+            let name = node.name_shared();
 
-            Self::remove_index_entry(&self.file_to_nodes, &file_path, idx);
-            Self::remove_index_entry(&self.name_index, &name, idx);
+            Self::remove_index_entry(&self.file_to_nodes, file_path.as_ref(), idx);
+            Self::remove_index_entry(&self.name_index, name.as_ref(), idx);
         }
 
         self.graph.remove_node(idx)
@@ -233,7 +242,9 @@ impl MemoryGraph {
 
     /// Invalidate and remove all nodes associated with a specific file.
     ///
-    /// Automatically detaches all connected edges from the graph.
+    /// Automatically detaches all connected edges from the graph. Name-index
+    /// cleanup is batched by name so a file contributing `k` nodes to a bucket
+    /// of `m` entries costs `O(m + k)` instead of `O(k × m)` (KG-08).
     pub fn remove_nodes_by_file(&mut self, file_path: &str) -> Vec<CodeEntityNode> {
         let indices = match self.file_to_nodes.remove(file_path) {
             Some((_, indices)) => indices,
@@ -241,15 +252,34 @@ impl MemoryGraph {
         };
 
         let mut removed_nodes = Vec::with_capacity(indices.len());
+        let mut names_to_remove: HashMap<Arc<str>, HashSet<NodeIndex>> = HashMap::new();
 
-        for idx in indices {
+        for &idx in indices.iter() {
             if let Some(node) = self.graph.node_weight(idx) {
-                let uri = node.uri().clone();
-                let name = node.name().to_string();
-
-                self.uri_to_node.remove(&uri);
-                Self::remove_index_entry(&self.name_index, &name, idx);
+                self.uri_to_node.remove(node.uri());
+                names_to_remove
+                    .entry(node.name_shared())
+                    .or_default()
+                    .insert(idx);
             }
+        }
+
+        for (name, victims) in names_to_remove {
+            let empty = if let Some(mut bucket) = self.name_index.get_mut(name.as_ref()) {
+                Arc::make_mut(bucket.value_mut()).retain(|idx| !victims.contains(idx));
+                let empty = bucket.value().is_empty();
+                drop(bucket);
+                empty
+            } else {
+                false
+            };
+
+            if empty {
+                self.name_index.remove(name.as_ref());
+            }
+        }
+
+        for &idx in indices.iter() {
             if let Some(removed) = self.graph.remove_node(idx) {
                 removed_nodes.push(removed);
             }
@@ -259,55 +289,70 @@ impl MemoryGraph {
     }
 
     /// Remove a single index entry and delete the bucket when it becomes empty.
-    fn remove_index_entry(map: &DashMap<String, Vec<NodeIndex>>, key: &str, idx: NodeIndex) {
-        if let Some(mut nodes) = map.get_mut(key) {
-            nodes.retain(|&i| i != idx);
-            let empty = nodes.is_empty();
-            drop(nodes);
-            if empty {
-                map.remove(key);
-            }
+    fn remove_index_entry(map: &DashMap<Arc<str>, Arc<Vec<NodeIndex>>>, key: &str, idx: NodeIndex) {
+        let empty = if let Some(mut bucket) = map.get_mut(key) {
+            Arc::make_mut(bucket.value_mut()).retain(|&i| i != idx);
+            let empty = bucket.value().is_empty();
+            drop(bucket);
+            empty
+        } else {
+            false
+        };
+
+        if empty {
+            map.remove(key);
         }
     }
 
     /// Find all nodes matching an unqualified symbol name.
-    pub fn find_nodes_by_name(&self, name: &str) -> Vec<NodeIndex> {
+    ///
+    /// Returns a shared snapshot. Cloning the result is an `Arc` reference-count
+    /// bump, not a copy of the bucket (KG-08).
+    pub fn find_nodes_by_name(&self, name: &str) -> Arc<Vec<NodeIndex>> {
         self.name_index
             .get(name)
-            .map(|entry| entry.clone())
-            .unwrap_or_default()
+            .map(|entry| Arc::clone(entry.value()))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
     /// Find all nodes originating from a specific file.
-    pub fn find_nodes_by_file(&self, file_path: &str) -> Vec<NodeIndex> {
+    ///
+    /// Returns a shared snapshot, like [`MemoryGraph::find_nodes_by_name`].
+    pub fn find_nodes_by_file(&self, file_path: &str) -> Arc<Vec<NodeIndex>> {
         self.file_to_nodes
             .get(file_path)
-            .map(|entry| entry.clone())
-            .unwrap_or_default()
+            .map(|entry| Arc::clone(entry.value()))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
-    /// Retrieve all outgoing edges from a given node index.
-    pub fn outgoing_edges(&self, idx: NodeIndex) -> Vec<(&CodeEntityNode, &CodeEdge)> {
-        let mut results = Vec::new();
-        for edge_ref in self.graph.edges_directed(idx, Direction::Outgoing) {
-            let target_idx = edge_ref.target();
-            if let Some(target_node) = self.graph.node_weight(target_idx) {
-                results.push((target_node, edge_ref.weight()));
-            }
-        }
-        results
+    /// Iterate over all outgoing edges from a node without allocating a result
+    /// vector (KG-08).
+    pub fn outgoing_edges(
+        &self,
+        idx: NodeIndex,
+    ) -> impl Iterator<Item = (&CodeEntityNode, &GraphEdge)> + '_ {
+        self.graph
+            .edges_directed(idx, Direction::Outgoing)
+            .filter_map(move |edge_ref| {
+                self.graph
+                    .node_weight(edge_ref.target())
+                    .map(|node| (node, edge_ref.weight()))
+            })
     }
 
-    /// Retrieve all incoming edges towards a given node index.
-    pub fn incoming_edges(&self, idx: NodeIndex) -> Vec<(&CodeEntityNode, &CodeEdge)> {
-        let mut results = Vec::new();
-        for edge_ref in self.graph.edges_directed(idx, Direction::Incoming) {
-            let source_idx = edge_ref.source();
-            if let Some(source_node) = self.graph.node_weight(source_idx) {
-                results.push((source_node, edge_ref.weight()));
-            }
-        }
-        results
+    /// Iterate over all incoming edges towards a node without allocating a
+    /// result vector (KG-08).
+    pub fn incoming_edges(
+        &self,
+        idx: NodeIndex,
+    ) -> impl Iterator<Item = (&CodeEntityNode, &GraphEdge)> + '_ {
+        self.graph
+            .edges_directed(idx, Direction::Incoming)
+            .filter_map(move |edge_ref| {
+                self.graph
+                    .node_weight(edge_ref.source())
+                    .map(|node| (node, edge_ref.weight()))
+            })
     }
 
     /// Compute statistics of the graph.
@@ -315,17 +360,16 @@ impl MemoryGraph {
         let mut stats = GraphStats {
             total_nodes: self.graph.node_count(),
             total_edges: self.graph.edge_count(),
-            total_files: self
-                .file_to_nodes
-                .iter()
-                .filter(|entry| !entry.value().is_empty())
-                .count(),
+            total_files: self.file_to_nodes.len(),
             ..Default::default()
         };
 
+        // Accumulate with `&'static str` keys so no temporary `String` is
+        // allocated per node/edge; only the distinct kind names are copied into
+        // the returned maps (KG-08).
+        let mut nodes_by_kind: HashMap<&'static str, usize> = HashMap::new();
         for node in self.graph.node_weights() {
-            let kind_str = format!("{:?}", node.kind());
-            *stats.nodes_by_kind.entry(kind_str).or_default() += 1;
+            *nodes_by_kind.entry(node.kind().as_str()).or_default() += 1;
 
             if node.kind().is_callable() {
                 stats.total_callables += 1;
@@ -334,11 +378,19 @@ impl MemoryGraph {
                 stats.total_types += 1;
             }
         }
+        stats.nodes_by_kind = nodes_by_kind
+            .into_iter()
+            .map(|(kind, count)| (kind.to_string(), count))
+            .collect();
 
+        let mut edges_by_kind: HashMap<&'static str, usize> = HashMap::new();
         for edge in self.graph.edge_weights() {
-            let kind_str = edge.kind.as_str().to_string();
-            *stats.edges_by_kind.entry(kind_str).or_default() += 1;
+            *edges_by_kind.entry(edge.kind().as_str()).or_default() += 1;
         }
+        stats.edges_by_kind = edges_by_kind
+            .into_iter()
+            .map(|(kind, count)| (kind.to_string(), count))
+            .collect();
 
         stats
     }
@@ -452,7 +504,7 @@ impl MemoryGraph {
                     )
                 })?;
 
-                if node.file_path() != file_path {
+                if node.file_path() != file_path.as_ref() {
                     return Err(format!(
                         "Integrity violation: file index '{}' contains node with path '{}'",
                         file_path,
@@ -497,7 +549,7 @@ impl MemoryGraph {
                     )
                 })?;
 
-                if node.name() != name {
+                if node.name() != name.as_ref() {
                     return Err(format!(
                         "Integrity violation: name index '{}' contains node with name '{}'",
                         name,
@@ -529,14 +581,14 @@ impl MemoryGraph {
                     format!("Integrity violation: edge {:?} has no endpoints", edge_idx)
                 })?;
 
-            let source = self.graph.node_weight(source_idx).ok_or_else(|| {
+            self.graph.node_weight(source_idx).ok_or_else(|| {
                 format!(
                     "Integrity violation: edge {:?} has missing source node {:?}",
                     edge_idx, source_idx
                 )
             })?;
 
-            let target = self.graph.node_weight(target_idx).ok_or_else(|| {
+            self.graph.node_weight(target_idx).ok_or_else(|| {
                 format!(
                     "Integrity violation: edge {:?} has missing target node {:?}",
                     edge_idx, target_idx
@@ -548,28 +600,31 @@ impl MemoryGraph {
                 .edge_weight(edge_idx)
                 .ok_or_else(|| format!("Integrity violation: edge {:?} has no weight", edge_idx))?;
 
-            if edge.source_uri != *source.uri() {
+            if edge.source() != source_idx {
                 return Err(format!(
-                    "Integrity violation: edge {:?} source URI '{}' does not match node URI '{}'",
+                    "Integrity violation: edge {:?} weight source {:?} does not match graph source {:?}",
                     edge_idx,
-                    edge.source_uri,
-                    source.uri()
+                    edge.source(),
+                    source_idx
                 ));
             }
 
-            if edge.target_uri != *target.uri() {
+            if edge.target() != target_idx {
                 return Err(format!(
-                    "Integrity violation: edge {:?} target URI '{}' does not match node URI '{}'",
+                    "Integrity violation: edge {:?} weight target {:?} does not match graph target {:?}",
                     edge_idx,
-                    edge.target_uri,
-                    target.uri()
+                    edge.target(),
+                    target_idx
                 ));
             }
 
-            if !edge_keys.insert((source_idx, target_idx, edge.kind)) {
+            if !edge_keys.insert((source_idx, target_idx, edge.kind())) {
                 return Err(format!(
                     "Integrity violation: duplicate edge {:?} for ({:?}, {:?}, {:?})",
-                    edge_idx, source_idx, target_idx, edge.kind
+                    edge_idx,
+                    source_idx,
+                    target_idx,
+                    edge.kind()
                 ));
             }
         }
@@ -585,6 +640,17 @@ mod tests {
 
     fn sample_node(repo: &str, file: &str, name: &str, kind: NodeKind) -> CodeEntityNode {
         let uri = SymbolUri::new(repo, file, None, name, kind.default_uri_suffix()).unwrap();
+        CodeEntityNode::try_new(uri, name, kind, file, "rust", SourceSpan::zero()).unwrap()
+    }
+
+    fn scoped_node(
+        repo: &str,
+        file: &str,
+        scope: &str,
+        name: &str,
+        kind: NodeKind,
+    ) -> CodeEntityNode {
+        let uri = SymbolUri::new(repo, file, Some(scope), name, kind.default_uri_suffix()).unwrap();
         CodeEntityNode::try_new(uri, name, kind, file, "rust", SourceSpan::zero()).unwrap()
     }
 
@@ -642,13 +708,13 @@ mod tests {
         let edge_idx = mg.add_edge(edge).expect("Failed to add edge");
 
         assert_eq!(mg.edge_count(), 1);
-        assert_eq!(mg.get_edge(edge_idx).unwrap().kind, EdgeKind::Calls);
+        assert_eq!(mg.get_edge(edge_idx).unwrap().kind(), EdgeKind::Calls);
 
-        let out = mg.outgoing_edges(idx_a);
+        let out: Vec<_> = mg.outgoing_edges(idx_a).collect();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0.name(), "load");
 
-        let inc = mg.incoming_edges(idx_b);
+        let inc: Vec<_> = mg.incoming_edges(idx_b).collect();
         assert_eq!(inc.len(), 1);
         assert_eq!(inc[0].0.name(), "add_file");
 
@@ -742,13 +808,15 @@ mod tests {
             .unwrap();
         let second = mg
             .add_edge(
-                CodeEdge::new(uri_a.clone(), uri_b.clone(), EdgeKind::Calls).with_confidence(0.5),
+                CodeEdge::new(uri_a.clone(), uri_b.clone(), EdgeKind::Calls)
+                    .with_confidence(0.5)
+                    .unwrap(),
             )
             .unwrap();
 
         assert_eq!(first, second);
         assert_eq!(mg.edge_count(), 1);
-        assert_eq!(mg.get_edge(second).unwrap().confidence, 0.5);
+        assert_eq!(mg.get_edge(second).unwrap().confidence().value(), 0.5);
 
         // A different relationship kind is a distinct edge.
         let third = mg
@@ -775,7 +843,8 @@ mod tests {
         mg.add_edge(edge.clone()).unwrap();
 
         // Bypass the public API to simulate a legacy duplicate edge.
-        mg.graph.add_edge(idx_a, idx_b, edge);
+        mg.graph
+            .add_edge(idx_a, idx_b, GraphEdge::from_code_edge(&edge, idx_a, idx_b));
         assert_eq!(mg.edge_count(), 2);
         assert!(mg.validate_integrity().is_err());
     }
@@ -853,6 +922,62 @@ mod tests {
         assert_eq!(stats.total_files, 2);
         assert_eq!(stats.total_callables, 2);
         assert_eq!(stats.total_types, 1);
+        assert_eq!(stats.nodes_by_kind.get("function"), Some(&2));
+        assert_eq!(stats.nodes_by_kind.get("struct"), Some(&1));
+        assert!(!stats.nodes_by_kind.contains_key("Function"));
+    }
+
+    #[test]
+    fn test_memory_graph_batched_name_removal_preserves_other_files() {
+        let mut mg = MemoryGraph::new();
+        mg.add_node(scoped_node(
+            "rusty",
+            "src/a.rs",
+            "A",
+            "new",
+            NodeKind::Function,
+        ))
+        .unwrap();
+        mg.add_node(scoped_node(
+            "rusty",
+            "src/a.rs",
+            "B",
+            "new",
+            NodeKind::Function,
+        ))
+        .unwrap();
+        mg.add_node(scoped_node(
+            "rusty",
+            "src/b.rs",
+            "C",
+            "new",
+            NodeKind::Function,
+        ))
+        .unwrap();
+
+        assert_eq!(mg.find_nodes_by_name("new").len(), 3);
+
+        let removed = mg.remove_nodes_by_file("src/a.rs");
+        assert_eq!(removed.len(), 2);
+        assert_eq!(mg.find_nodes_by_name("new").len(), 1);
+        assert_eq!(mg.find_nodes_by_file("src/b.rs").len(), 1);
+
+        mg.validate_integrity().expect("Graph integrity failed");
+    }
+
+    #[test]
+    fn test_memory_graph_find_returns_shared_snapshots() {
+        let mut mg = MemoryGraph::new();
+        mg.add_node(sample_node("rusty", "src/a.rs", "foo", NodeKind::Function))
+            .unwrap();
+
+        let first = mg.find_nodes_by_name("foo");
+        let second = mg.find_nodes_by_name("foo");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let first_file = mg.find_nodes_by_file("src/a.rs");
+        let second_file = mg.find_nodes_by_file("src/a.rs");
+        assert!(Arc::ptr_eq(&first_file, &second_file));
     }
 
     #[test]
@@ -863,7 +988,10 @@ mod tests {
         mg.add_node(node).unwrap();
 
         // Simulate a legacy corrupt bucket: empty but still present.
-        mg.name_index.get_mut("foo").unwrap().clear();
+        {
+            let mut bucket = mg.name_index.get_mut("foo").unwrap();
+            Arc::make_mut(bucket.value_mut()).clear();
+        }
         assert!(mg.validate_integrity().is_err());
 
         mg.clear();
