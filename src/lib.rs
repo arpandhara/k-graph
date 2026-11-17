@@ -8,6 +8,7 @@ pub mod model;
 pub mod parser;
 pub mod persistence;
 pub mod resolver;
+pub mod storage;
 
 // Re-export core abstractions
 pub use graph::{GraphEdge, GraphError, GraphStats, MemoryGraph};
@@ -27,4 +28,8 @@ pub use resolver::{
     CallSeparator, CallShape, Candidate, Linker, ModuleMatch, RankedCandidate, ResolutionConfig,
     ResolutionReport, ResolutionStrategy, ResolvedCall, ResolverError, ScopeChain, ScopeIndex,
     UnresolvedCall, UnresolvedReason,
+};
+pub use storage::{
+    FileIndex, GraphStore, META_LAST_COMMIT, META_REPO_NAME, META_SCHEMA_VERSION,
+    STORAGE_SCHEMA_VERSION, StorageError, StoreReport, WriteBatch, WriteReport, edge_key,
 };
